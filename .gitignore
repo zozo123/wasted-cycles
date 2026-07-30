@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.vinext/
+.wrangler/
+dist/
+bin/
+coverage/
+.DS_Store
+*.test
