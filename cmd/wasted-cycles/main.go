@@ -97,7 +97,7 @@ func resolveWindow(ytd bool, days int, now time.Time) (analyze.Window, time.Time
 		return analyze.Window30d, analyze.Window30d.Since(now)
 	default:
 		// Custom --days keeps an exact lookback; the nearest chip is only a hint
-		// until the user presses 7 / 0 / y and snaps to a named window.
+		// until the user presses W / M / Y and snaps to a named window.
 		return analyze.WindowFromDays(days, now), now.Add(-time.Duration(days) * 24 * time.Hour)
 	}
 }

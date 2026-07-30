@@ -119,11 +119,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.tab = tabRuns
 		case "4":
 			m.tab = tabMethod
-		case "7":
+		case "w", "W":
 			return m.setWindow(analyze.Window7d)
-		case "0":
+		case "m", "M":
 			return m.setWindow(analyze.Window30d)
-		case "y":
+		case "y", "Y":
 			return m.setWindow(analyze.WindowYTD)
 		case "]":
 			return m.setWindow(m.window.Next())
@@ -246,9 +246,9 @@ func (m Model) statusBanner(width int) string {
 }
 
 func (m Model) footer(width int) string {
-	left, right := "←/→ view   7/0/y range   q quit", "local only · no uploads"
+	left, right := "←/→ view   W/M/Y range   q quit", "local only · no uploads"
 	if lipgloss.Width(left)+lipgloss.Width(right)+1 > width {
-		left, right = "←/→ · 7/0/y · q", "local only"
+		left, right = "←/→ · W/M/Y · q", "local only"
 	}
 	return lipgloss.NewStyle().Foreground(muted).Render(spread(left, right, width))
 }
@@ -532,7 +532,7 @@ func (m Model) method(width int) string {
 		{"Gaps", "Over 2h is a session break and is dropped. Shorter gaps are capped at 30m and marked clamped. " + inferredNote(m.report), ink},
 		{"Soft edges", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Cursor and Grok only stamp turns, so a segment spans a whole turn. Scheduled Cursor agents that tick on a fixed interval are dropped. Per-segment confidence is in --json.", ink},
 		{"Detected", sources, ink},
-		{"Window", fmt.Sprintf("%s from %s. Press 7 / 0 / y or [ ] to rescan.", m.window.Label(), m.report.Since.Local().Format("2006-01-02")), ink},
+		{"Window", fmt.Sprintf("%s from %s. Press W / M / Y or [ ] to rescan.", m.window.Label(), m.report.Since.Local().Format("2006-01-02")), ink},
 	}
 
 	lines := []string{heading("METHOD & LIMITS", "use the number, know its edges"), ""}
@@ -559,7 +559,7 @@ func (m Model) empty(width int) string {
 		lipgloss.NewStyle().Foreground(muted).Render(wrap(
 			"Looked in ~/.codex/sessions, ~/.claude/projects, ~/.cursor/projects and ~/.grok/sessions.", width-4)),
 		"",
-		lipgloss.NewStyle().Foreground(ink).Render("Widen the window:") + lipgloss.NewStyle().Foreground(working).Render("  press 0 (30d) or y (YTD)"),
+		lipgloss.NewStyle().Foreground(ink).Render("Widen the window:") + lipgloss.NewStyle().Foreground(working).Render("  press M (30d) or Y (YTD)"),
 		lipgloss.NewStyle().Foreground(ink).Render("See the interface:") + lipgloss.NewStyle().Foreground(working).Render("  wasted-cycles --demo"),
 	}, "\n"))
 }
