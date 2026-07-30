@@ -425,25 +425,53 @@ func legend() string {
 func (m Model) leaks(width int) string {
 	lines := []string{heading("BIGGEST STALLS", "ranked by machine time"), ""}
 	if len(m.report.Findings) == 0 {
-		return strings.Join(append(lines,
+		lines = append(lines,
 			lipgloss.NewStyle().Foreground(working).Bold(true).Render("Nothing is blocking runs"),
 			lipgloss.NewStyle().Foreground(muted).Render(wrap("No build, test, CI, container, or package wait is material in this window.", width)),
-		), "\n")
+		)
+	} else {
+		for index, finding := range m.report.Findings {
+			if index >= 3 {
+				break
+			}
+			if index > 0 {
+				lines = append(lines, "")
+			}
+			lines = append(lines,
+				lipgloss.NewStyle().Foreground(blocked).Bold(true).Render(fmt.Sprintf("%d ", index+1))+
+					lipgloss.NewStyle().Bold(true).Foreground(ink).Render(truncate(finding.Title, width-2)),
+				lipgloss.NewStyle().Foreground(muted).Render(wrap(duration(finding.Recoverable)+" on the critical path", width)),
+			)
+		}
 	}
-	for index, finding := range m.report.Findings {
-		if index >= 3 {
-			break
-		}
-		if index > 0 {
-			lines = append(lines, "")
-		}
-		lines = append(lines,
-			lipgloss.NewStyle().Foreground(blocked).Bold(true).Render(fmt.Sprintf("%d ", index+1))+
-				lipgloss.NewStyle().Bold(true).Foreground(ink).Render(truncate(finding.Title, width-2)),
-			lipgloss.NewStyle().Foreground(muted).Render(wrap(duration(finding.Recoverable)+" on the critical path", width)),
+	if savings := m.report.Savings; savings != nil {
+		lines = append(lines, "",
+			heading("IF FIXED", "illustrative"),
+			lipgloss.NewStyle().Foreground(ink).Render(truncate(savingsHeadline(savings), width)),
+			lipgloss.NewStyle().Foreground(muted).Render(wrap("Illustrative only — not a quote. See Method.", width)),
 		)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func savingsHeadline(savings *analyze.Savings) string {
+	line := fmt.Sprintf("~%s  ·  ~%s eng  ·  ~%s CI",
+		duration(savings.Addressable), moneyUSD(savings.EngineerUSD), moneyUSD(savings.ComputeUSD))
+	if savings.AnnualEngineerUSD > 0 {
+		line += fmt.Sprintf("  ·  ~%s/yr eng", moneyUSD(savings.AnnualEngineerUSD))
+	}
+	return line
+}
+
+func moneyUSD(value float64) string {
+	switch {
+	case value < 1:
+		return fmt.Sprintf("$%.2f", value)
+	case value < 1000:
+		return fmt.Sprintf("$%.0f", value)
+	default:
+		return fmt.Sprintf("$%.0fk", math.Round(value/1000))
+	}
 }
 
 func (m Model) runs(width int) string {
@@ -533,6 +561,19 @@ func (m Model) method(width int) string {
 		{"Soft edges", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Cursor and Grok only stamp turns, so a segment spans a whole turn. Scheduled Cursor agents that tick on a fixed interval are dropped. Per-segment confidence is in --json.", ink},
 		{"Detected", sources, ink},
 		{"Window", fmt.Sprintf("%s from %s. Press W / M / Y or [ ] to rescan.", m.window.Label(), m.report.Since.Local().Format("2006-01-02")), ink},
+	}
+	if savings := m.report.Savings; savings != nil {
+		options := "Incredibuild Build Runner, Blacksmith, CircleCI — informational links only."
+		rows = append(rows,
+			struct {
+				label, body string
+				colour      lipgloss.Color
+			}{"If fixed", savings.Assumptions + " " + savingsHeadline(savings), blocked},
+			struct {
+				label, body string
+				colour      lipgloss.Color
+			}{"Disclaimer", savings.Disclaimer + " Options: " + options, outside},
+		)
 	}
 
 	lines := []string{heading("METHOD & LIMITS", "use the number, know its edges"), ""}
