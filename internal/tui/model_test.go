@@ -1,0 +1,135 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/zozo123/wasted-cycles/internal/analyze"
+)
+
+func reports() map[string]analyze.Report {
+	return map[string]analyze.Report{
+		"demo":  analyze.DemoReport(),
+		"empty": {GeneratedAt: time.Now(), Since: time.Now().Add(-7 * 24 * time.Hour)},
+	}
+}
+
+func TestViewNeverPanicsAcrossTerminalSizes(t *testing.T) {
+	sizes := []struct{ width, height int }{
+		{0, 0}, {1, 1}, {10, 3}, {20, 5}, {40, 12}, {68, 24}, {104, 32}, {400, 120},
+	}
+	for name, report := range reports() {
+		for _, size := range sizes {
+			for tab := tabOverview; tab <= tabMethod; tab++ {
+				model, _ := New(report, "test").Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+				view := model.(Model)
+				view.tab = tab
+				func() {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							t.Fatalf("%s report, %dx%d, tab %d panicked: %v", name, size.width, size.height, tab, recovered)
+						}
+					}()
+					if view.View() == "" {
+						t.Fatalf("%s report, %dx%d, tab %d rendered nothing", name, size.width, size.height, tab)
+					}
+				}()
+			}
+		}
+	}
+}
+
+func TestNoRenderedLineExceedsTheTerminal(t *testing.T) {
+	// A single over-wide line wraps and shifts everything below it, which is how
+	// the footer used to break every view at every width.
+	for name, report := range reports() {
+		for _, width := range []int{68, 74, 80, 100, 140} {
+			for tab := tabOverview; tab <= tabMethod; tab++ {
+				model, _ := New(report, "test").Update(tea.WindowSizeMsg{Width: width, Height: 40})
+				view := model.(Model)
+				view.tab = tab
+				for index, line := range strings.Split(view.View(), "\n") {
+					if got := ansi.StringWidth(line); got > width {
+						t.Fatalf("%s report, width %d, tab %d: line %d is %d columns\n%q",
+							name, width, tab, index, got, line)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestTabNavigationWraps(t *testing.T) {
+	model := New(analyze.DemoReport(), "test")
+	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	if got := next.(Model).tab; got != tabMethod {
+		t.Fatalf("left from the first tab should wrap to the last, got %d", got)
+	}
+	forward := model
+	for i := 0; i < 4; i++ {
+		updated, _ := forward.Update(tea.KeyMsg{Type: tea.KeyRight})
+		forward = updated.(Model)
+	}
+	if forward.tab != tabOverview {
+		t.Fatalf("four steps right should return to the first tab, got %d", forward.tab)
+	}
+}
+
+func TestQuitKeys(t *testing.T) {
+	for _, key := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune{'q'}},
+		{Type: tea.KeyCtrlC},
+		{Type: tea.KeyEsc},
+	} {
+		if _, cmd := New(analyze.DemoReport(), "test").Update(key); cmd == nil {
+			t.Fatalf("%s should quit", key)
+		}
+	}
+}
+
+func TestTruncateIsRuneSafe(t *testing.T) {
+	if got := truncate("日本語のプロジェクト", 6); strings.Contains(got, "\ufffd") {
+		t.Fatalf("truncate split a multi-byte rune: %q", got)
+	}
+	if got := truncate("abcdef", 4); got != "abc…" {
+		t.Fatalf("truncate(abcdef, 4) = %q", got)
+	}
+	if got := truncate("abc", 10); got != "abc" {
+		t.Fatalf("short strings should pass through, got %q", got)
+	}
+	if got := truncate("abc", 0); got != "" {
+		t.Fatalf("zero width should render nothing, got %q", got)
+	}
+}
+
+func TestPlainSummary(t *testing.T) {
+	output := Plain(analyze.DemoReport())
+	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "RUNS", "turn resolution"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("plain output is missing %q:\n%s", want, output)
+		}
+	}
+	empty := Plain(analyze.Report{Since: time.Now().Add(-24 * time.Hour)})
+	if !strings.Contains(empty, "No recent supported traces") {
+		t.Fatalf("empty report should explain itself:\n%s", empty)
+	}
+}
+
+func TestDurationFormatting(t *testing.T) {
+	cases := map[time.Duration]string{
+		30 * time.Second:             "30s",
+		5 * time.Minute:              "5m",
+		90 * time.Minute:             "1h 30m",
+		25*time.Hour + 3*time.Minute: "25h 03m",
+		0:                            "0s",
+	}
+	for value, want := range cases {
+		if got := duration(value); got != want {
+			t.Fatalf("duration(%s) = %q, want %q", value, got, want)
+		}
+	}
+}

@@ -18,6 +18,7 @@ func DemoReport() Report {
 			{"explore", "read / search", 11 * time.Minute},
 			{"edit", "code change", 16 * time.Minute},
 			{"verify", "test suite", 9 * time.Minute},
+			{"tool_other", "shell command", 6 * time.Minute},
 			{"ci_wait", "CI feedback", 24 * time.Minute},
 			{"retry", "repeated test suite", 8 * time.Minute},
 		}},
@@ -46,7 +47,11 @@ func DemoReport() Report {
 	report := Report{GeneratedAt: now, Since: now.Add(-7 * 24 * time.Hour), IsDemo: true}
 	cursor := now.Add(-5 * time.Hour)
 	for _, row := range rows {
-		session := Session{ID: row.id, Provider: row.provider, Project: row.project, Start: cursor}
+		resolution := resolutionEvent
+		if row.provider == "cursor" || row.provider == "grok" {
+			resolution = resolutionTurn
+		}
+		session := Session{ID: row.id, Provider: row.provider, Project: row.project, Start: cursor, Resolution: resolution}
 		for _, item := range row.segments {
 			segment := Segment{
 				Start: cursor, End: cursor.Add(item.duration), Duration: item.duration,

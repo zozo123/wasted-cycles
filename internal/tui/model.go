@@ -3,12 +3,12 @@ package tui
 import (
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/zozo123/wasted-cycles/internal/analyze"
 )
@@ -32,6 +32,7 @@ var (
 	yellow    = lipgloss.Color("#FFD166")
 	red       = lipgloss.Color("#FF5D73")
 	teal      = lipgloss.Color("#57D7C4")
+	slate     = lipgloss.Color("#7C8B96")
 	baseStyle = lipgloss.NewStyle().Foreground(ink)
 )
 
@@ -94,8 +95,14 @@ func (m Model) View() string {
 	}
 
 	header := m.header(bodyWidth)
-	footer := lipgloss.NewStyle().Foreground(muted).Width(bodyWidth).Render(
-		"←/→ switch view   1–4 jump   q quit" + strings.Repeat(" ", max(1, bodyWidth-47)) + "local only · no uploads",
+	left, right := "←/→ switch view   1–4 jump   q quit", "local only · no uploads"
+	gap := bodyWidth - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		left, right = "←/→ · 1–4 · q", "local only"
+		gap = bodyWidth - lipgloss.Width(left) - lipgloss.Width(right)
+	}
+	footer := lipgloss.NewStyle().Foreground(muted).Render(
+		truncate(left+strings.Repeat(" ", max(1, gap))+right, bodyWidth),
 	)
 	page := lipgloss.JoinVertical(lipgloss.Left, header, "", body, "", footer)
 	return lipgloss.NewStyle().MarginLeft(2).MarginTop(1).Render(page)
@@ -130,14 +137,22 @@ func (m Model) overview(width int) string {
 	if len(m.report.Sessions) == 0 {
 		return m.empty(width)
 	}
-	cardWidth := max(18, (width-3)/4)
+	perRow := 4
+	if width < 76 {
+		perRow = 2
+	}
+	cardWidth := max(18, (width-perRow+1)/perRow)
 	cards := []string{
 		statCard(cardWidth, "OBSERVED", duration(m.report.Observed), "wall-clock in traces", ink),
 		statCard(cardWidth, "REASONING SHARE", percent(categoryDuration(m.report, "reasoning"), m.report.Observed), "model inference proxy", purple),
 		statCard(cardWidth, "RECOVERABLE", duration(m.report.Recoverable), "blocked + repeated", red),
 		statCard(cardWidth, "THROUGHPUT", fmt.Sprintf("%.0f%%", m.report.Throughput*100), throughputLabel(m.report.Throughput), lime),
 	}
-	cardsRow := lipgloss.JoinHorizontal(lipgloss.Top, cards...)
+	var rows []string
+	for start := 0; start < len(cards); start += perRow {
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, cards[start:min(start+perRow, len(cards))]...))
+	}
+	cardsRow := lipgloss.JoinVertical(lipgloss.Left, rows...)
 
 	leftWidth := max(38, int(float64(width)*0.58))
 	rightWidth := width - leftWidth - 2
@@ -159,7 +174,10 @@ func (m Model) histogram(width int) string {
 	barWidth := max(8, width-labelWidth-13)
 	lines := []string{title, ""}
 	for _, category := range m.report.Categories {
-		ratio := float64(category.Duration) / float64(maxDuration)
+		ratio := 0.0
+		if maxDuration > 0 {
+			ratio = float64(category.Duration) / float64(maxDuration)
+		}
 		fill := int(math.Round(ratio * float64(barWidth)))
 		color := categoryColor(category.ID)
 		bar := lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", fill))
@@ -169,7 +187,7 @@ func (m Model) histogram(width int) string {
 		lines = append(lines, label+" "+bar+" "+value)
 	}
 	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(
-		"Time between timestamped trace events · idle gaps capped at 30m",
+		"Time between timestamped trace events · breaks over 2h dropped, shorter gaps capped at 30m",
 	))
 	return strings.Join(lines, "\n")
 }
@@ -217,7 +235,7 @@ func (m Model) timeline(width int) string {
 		value := lipgloss.NewStyle().Width(9).Align(lipgloss.Right).Foreground(muted).Render(duration(session.Duration))
 		lines = append(lines, lipgloss.NewStyle().Width(labelWidth).Foreground(ink).Render(label)+bar+value)
 	}
-	lines = append(lines, "", legend(width))
+	lines = append(lines, "", legend(width-4))
 	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(
 		"Long offline gaps are excluded. Repeated test/CI commands are reclassified as retries.",
 	))
@@ -230,18 +248,46 @@ func (m Model) sessions(width int) string {
 	if len(m.report.Sessions) == 0 {
 		return m.empty(width)
 	}
-	header := lipgloss.NewStyle().Foreground(muted).Render(
-		fmt.Sprintf("%-12s %-24s %10s %12s %11s", "HARNESS", "PROJECT", "OBSERVED", "THROUGHPUT", "ENDED"),
+	// Columns are dropped rather than wrapped as the terminal narrows: a wrapped
+	// row is unreadable, a shorter row is not.
+	inner := width - 4
+	showDetail, showEnded := inner >= 78, inner >= 66
+	project := max(8, min(22, inner-44))
+	layout := "%-10s %-" + fmt.Sprint(project) + "s %10s %11.0f%%"
+	heads := []any{"HARNESS", "PROJECT", "OBSERVED", "THROUGHPUT"}
+	headLayout := "%-10s %-" + fmt.Sprint(project) + "s %10s %12s"
+	if showEnded {
+		layout, headLayout = layout+" %11s", headLayout+" %11s"
+		heads = append(heads, "ENDED")
+	}
+	if showDetail {
+		layout, headLayout = layout+" %6s", headLayout+" %6s"
+		heads = append(heads, "DETAIL")
+	}
+
+	lines = append(lines,
+		lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf(headLayout, heads...)),
+		lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("─", max(1, min(inner, 82)))),
 	)
-	lines = append(lines, header, lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("─", min(width-4, 75))))
+	coarse := false
 	for _, session := range m.report.Sessions {
-		row := fmt.Sprintf("%-12s %-24s %10s %11.0f%% %11s",
-			truncate(session.Provider, 12),
-			truncate(session.Project, 24),
+		detail := "event"
+		if session.Resolution == "turn" {
+			detail, coarse = "turn", true
+		}
+		values := []any{
+			truncate(session.Provider, 10),
+			truncate(session.Project, project),
 			duration(session.Duration),
-			session.Throughput*100,
-			session.End.Format("Jan 02 15:04"),
-		)
+			session.Throughput * 100,
+		}
+		if showEnded {
+			values = append(values, session.End.Format("Jan 02 15:04"))
+		}
+		if showDetail {
+			values = append(values, detail)
+		}
+		row := fmt.Sprintf(layout, values...)
 		color := lime
 		if session.Throughput < .7 {
 			color = yellow
@@ -251,9 +297,11 @@ func (m Model) sessions(width int) string {
 		}
 		lines = append(lines, lipgloss.NewStyle().Foreground(color).Render(row))
 	}
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(
-		"Throughput = observed time minus CI, human, agent, dependency, and retry waits.",
-	))
+	note := "Throughput = observed time minus CI, human, agent, dependency, and retry waits."
+	if coarse && showDetail {
+		note += "\nturn = the harness records no per-event timestamps, so segments span a whole turn."
+	}
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(note))
 	return panelStyle(width).Render(strings.Join(lines, "\n"))
 }
 
@@ -270,17 +318,28 @@ func (m Model) method(width int) string {
 		sectionTitle("METHOD & TRUST", "use the number, know its limits"),
 		"",
 		lipgloss.NewStyle().Bold(true).Foreground(ink).Render("What is measured"),
-		wrap("Wasted Cycles reads local JSON/JSONL traces and reconstructs elapsed wall-clock segments between timestamped events. It recognizes Codex, Claude Code, Cursor, and Grok Build trace roots.", width-4),
+		wrap("Wasted Cycles reads local JSONL traces and reconstructs elapsed wall-clock segments between timestamped events. Each segment is classified by the structured action that opened it: the tool that was called, the command it ran, or the message that ended a turn. Records it cannot identify are skipped rather than guessed, so their elapsed time stays attributed to the last recognized action.", width-4),
 		"",
 		lipgloss.NewStyle().Bold(true).Foreground(purple).Render("Inference is a proxy"),
-		wrap("Harnesses expose different timing detail. “Model work” means the interval after a user/tool result and before the next emitted action. It is not GPU compute time unless the trace explicitly records duration.", width-4),
+		wrap("Harnesses expose different timing detail. “Model work” means the interval after a user message or tool result and before the next emitted action. It is not GPU compute time unless the trace explicitly records duration.", width-4),
 		"",
-		lipgloss.NewStyle().Bold(true).Foreground(yellow).Render("Guardrails"),
-		wrap("Offline gaps are capped at 30 minutes. Prompt text and source code are never retained, rendered, or uploaded. Classification uses event metadata and command names; inspect JSON output for auditability.", width-4),
+		lipgloss.NewStyle().Bold(true).Foreground(yellow).Render("Resolution differs by harness"),
+		wrap("Codex, Claude Code, and Grok Build stamp individual events. Cursor does not, so its transcripts are reconstructed per user turn and each turn takes the dominant tool category it observed. Those runs are marked “turn” on the Runs screen and carry low confidence in JSON output.", width-4),
+		"",
+		lipgloss.NewStyle().Bold(true).Foreground(red).Render("Guardrails"),
+		wrap("A gap longer than 2 hours is treated as a session break and is not counted at all, so an overnight pause cannot become “waiting for human”. Shorter gaps are capped at 30 minutes; those segments are marked clamped with low confidence. "+inferredNote(m.report)+" Prompt text and source code are never retained, rendered, or uploaded.", width-4),
 		"",
 		lipgloss.NewStyle().Foreground(muted).Render("Detected  " + sourceText),
 	}
 	return panelStyle(width).Render(strings.Join(copy, "\n"))
+}
+
+func inferredNote(report analyze.Report) string {
+	if report.Inferred <= 0 || report.Observed <= 0 {
+		return "No time in this report came from a clamped gap."
+	}
+	return fmt.Sprintf("In this report %s of %s observed (%s) is clamped rather than measured.",
+		duration(report.Inferred), duration(report.Observed), percent(report.Inferred, report.Observed))
 }
 
 func (m Model) empty(width int) string {
@@ -355,8 +414,8 @@ func legend(width int) string {
 		id, label string
 	}{
 		{"reasoning", "model"}, {"explore", "read"}, {"edit", "edit"},
-		{"verify", "test"}, {"ci_wait", "CI"}, {"human_wait", "human"},
-		{"agent_wait", "agents"}, {"retry", "retry"},
+		{"verify", "test"}, {"tool_other", "other"}, {"ci_wait", "CI"},
+		{"human_wait", "human"}, {"agent_wait", "agents"}, {"retry", "retry"},
 	}
 	var rendered []string
 	for _, item := range items {
@@ -378,6 +437,8 @@ func categoryColor(category string) lipgloss.Color {
 		return lime
 	case "verify":
 		return teal
+	case "tool_other":
+		return slate
 	case "ci_wait":
 		return orange
 	case "agent_wait":
@@ -450,7 +511,7 @@ func truncate(value string, width int) string {
 	if width == 1 {
 		return "…"
 	}
-	return value[:min(len(value), width-1)] + "…"
+	return ansi.Truncate(value, width-1, "") + "…"
 }
 
 func wrap(value string, width int) string {
@@ -488,10 +549,4 @@ func max(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func sortedCategories(report analyze.Report) []analyze.Category {
-	out := append([]analyze.Category(nil), report.Categories...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Duration > out[j].Duration })
-	return out
 }
