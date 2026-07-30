@@ -24,10 +24,11 @@ type Options struct {
 }
 
 type Category struct {
-	ID          string        `json:"id"`
-	Label       string        `json:"label"`
-	Duration    time.Duration `json:"duration_ns"`
-	Recoverable bool          `json:"recoverable"`
+	ID       string        `json:"id"`
+	Label    string        `json:"label"`
+	Group    string        `json:"group"`
+	Duration time.Duration `json:"duration_ns"`
+	Share    float64       `json:"share"`
 }
 
 type Segment struct {
@@ -50,6 +51,7 @@ type Session struct {
 	Start      time.Time     `json:"start"`
 	End        time.Time     `json:"end"`
 	Duration   time.Duration `json:"duration_ns"`
+	Human      time.Duration `json:"human_ns"`
 	Throughput float64       `json:"throughput"`
 	Resolution string        `json:"resolution"`
 	Segments   []Segment     `json:"segments"`
@@ -72,7 +74,8 @@ type Report struct {
 	GeneratedAt time.Time     `json:"generated_at"`
 	Since       time.Time     `json:"since"`
 	Observed    time.Duration `json:"observed_ns"`
-	Recoverable time.Duration `json:"recoverable_ns"`
+	Blocked     time.Duration `json:"blocked_ns"`
+	Human       time.Duration `json:"human_ns"`
 	Inferred    time.Duration `json:"inferred_ns"`
 	Throughput  float64       `json:"throughput"`
 	Sessions    []Session     `json:"sessions"`
@@ -105,23 +108,51 @@ const (
 	maxLineBytes    = 4 << 20
 )
 
+// Wasted Cycles measures the machine time an agent burns waiting on compute it
+// does not control. Time spent waiting on a person is not a wasted cycle, so it
+// is reported separately and never enters the metric.
+const (
+	GroupWorking  = "working"
+	GroupBlocked  = "blocked"
+	GroupExcluded = "excluded"
+)
+
 var categoryOrder = []string{
-	"reasoning", "explore", "edit", "verify", "tool_other", "ci_wait",
-	"agent_wait", "human_wait", "dependency_wait", "retry", "unknown",
+	"reasoning", "explore", "edit", "tool_other", "unknown",
+	"build_wait", "test_wait", "ci_wait", "container_wait", "dependency_wait", "agent_wait", "retry",
+	"human_wait",
 }
 
 var categoryLabels = map[string]string{
 	"reasoning":       "Model work",
 	"explore":         "Read & search",
 	"edit":            "Code changes",
-	"verify":          "Local verify",
 	"tool_other":      "Other tool work",
-	"ci_wait":         "Waiting for CI",
-	"agent_wait":      "Waiting for agents",
-	"human_wait":      "Waiting for human",
-	"dependency_wait": "Tool / network wait",
-	"retry":           "Retries",
 	"unknown":         "Unclassified",
+	"build_wait":      "Waiting for build",
+	"test_wait":       "Waiting for tests",
+	"ci_wait":         "Waiting for CI",
+	"container_wait":  "Waiting for containers",
+	"dependency_wait": "Waiting for packages",
+	"agent_wait":      "Waiting for agents",
+	"retry":           "Repeated build / test",
+	"human_wait":      "Outside the agent loop",
+}
+
+var categoryGroups = map[string]string{
+	"reasoning": GroupWorking, "explore": GroupWorking, "edit": GroupWorking,
+	"tool_other": GroupWorking, "unknown": GroupWorking,
+	"build_wait": GroupBlocked, "test_wait": GroupBlocked, "ci_wait": GroupBlocked,
+	"container_wait": GroupBlocked, "dependency_wait": GroupBlocked,
+	"agent_wait": GroupBlocked, "retry": GroupBlocked,
+	"human_wait": GroupExcluded,
+}
+
+func CategoryGroup(id string) string {
+	if group, ok := categoryGroups[id]; ok {
+		return group
+	}
+	return GroupWorking
 }
 
 func (o Options) withDefaults() Options {
@@ -213,7 +244,6 @@ func discover(home string, since time.Time) []candidate {
 	}{
 		{"codex", filepath.Join(home, ".codex", "sessions")},
 		{"claude", filepath.Join(home, ".claude", "projects")},
-		{"cursor", filepath.Join(home, ".cursor", "projects")},
 		{"grok", filepath.Join(home, ".grok", "sessions")},
 	}
 	var out []candidate
@@ -276,7 +306,8 @@ func parseSession(file candidate, opts Options) (Session, bool) {
 	if file.Provider == "grok" {
 		id = filepath.Base(filepath.Dir(file.Path))
 	}
-	if project == "" {
+	project = cleanProject(project)
+	if project == unknownProject {
 		project = inferProject(file)
 	}
 	session := Session{
@@ -300,9 +331,9 @@ func parseSession(file candidate, opts Options) (Session, bool) {
 		if clamped {
 			confidence = .3
 		}
-		if current.Key != "" {
+		if current.Key != "" && repeatable(category) {
 			seen[current.Key]++
-			if seen[current.Key] > 1 && (category == "verify" || category == "ci_wait") {
+			if seen[current.Key] > 1 {
 				category, label = "retry", "repeated "+label
 			}
 		}
@@ -311,13 +342,30 @@ func parseSession(file candidate, opts Options) (Session, bool) {
 			Category: category, Label: label, Provider: file.Provider,
 			SessionID: session.ID, Confidence: confidence, Clamped: clamped,
 		})
-		session.Duration += duration
+	}
+
+	total, blocked := machineTime(session.Segments)
+	session.Duration = total
+	for _, segment := range session.Segments {
+		if CategoryGroup(segment.Category) == GroupExcluded {
+			session.Human += segment.Duration
+		}
 	}
 	if session.Duration < time.Second {
 		return Session{}, false
 	}
-	session.Throughput = float64(activeDuration(session.Segments)) / float64(session.Duration)
+	session.Throughput = float64(session.Duration-blocked) / float64(session.Duration)
 	return session, true
+}
+
+// A repeated build, test, or CI command means the machine did the same work
+// twice. Repeating a read or an edit does not.
+func repeatable(category string) bool {
+	switch category {
+	case "build_wait", "test_wait", "ci_wait":
+		return true
+	}
+	return false
 }
 
 func clampToWindow(events []event, since time.Time) []event {
@@ -362,10 +410,6 @@ func interval(current, next event) (string, string, float64) {
 }
 
 func readEvents(file candidate) ([]event, string, string) {
-	if file.Provider == "cursor" {
-		events, project := cursorEvents(file.Path)
-		return events, project, resolutionTurn
-	}
 	handle, err := os.Open(file.Path)
 	if err != nil {
 		return nil, "", resolutionEvent
@@ -385,7 +429,7 @@ func readEvents(file candidate) ([]event, string, string) {
 			continue
 		}
 		if project == "" {
-			project = cleanProject(recordProject(record))
+			project = recordProject(record)
 		}
 		at := recordTime(record)
 		if at.IsZero() {
@@ -556,11 +600,19 @@ func grokBoundaryEvents(path string) []event {
 func finalize(report *Report) {
 	totals := map[string]time.Duration{}
 	for _, session := range report.Sessions {
-		report.Observed += session.Duration
 		for _, segment := range session.Segments {
 			totals[segment.Category] += segment.Duration
-			if segment.Clamped {
-				report.Inferred += segment.Duration
+			switch CategoryGroup(segment.Category) {
+			case GroupExcluded:
+				report.Human += segment.Duration
+			default:
+				report.Observed += segment.Duration
+				if CategoryGroup(segment.Category) == GroupBlocked {
+					report.Blocked += segment.Duration
+				}
+				if segment.Clamped {
+					report.Inferred += segment.Duration
+				}
 			}
 		}
 	}
@@ -568,16 +620,17 @@ func finalize(report *Report) {
 		if totals[id] == 0 {
 			continue
 		}
-		recoverable := isRecoverable(id)
-		report.Categories = append(report.Categories, Category{
-			ID: id, Label: categoryLabels[id], Duration: totals[id], Recoverable: recoverable,
-		})
-		if recoverable {
-			report.Recoverable += totals[id]
+		share := 0.0
+		if report.Observed > 0 && CategoryGroup(id) != GroupExcluded {
+			share = float64(totals[id]) / float64(report.Observed)
 		}
+		report.Categories = append(report.Categories, Category{
+			ID: id, Label: categoryLabels[id], Group: CategoryGroup(id),
+			Duration: totals[id], Share: share,
+		})
 	}
 	if report.Observed > 0 {
-		report.Throughput = float64(report.Observed-report.Recoverable) / float64(report.Observed)
+		report.Throughput = float64(report.Observed-report.Blocked) / float64(report.Observed)
 	}
 	report.Findings = buildFindings(totals)
 }
@@ -588,11 +641,13 @@ func buildFindings(totals map[string]time.Duration) []Finding {
 		Min                       time.Duration
 	}
 	specs := []spec{
-		{"ci_wait", "CI is your longest feedback loop", "Agent runs are blocked on remote checks instead of continuing useful work.", "Mirror the slow gate locally and split independent checks into parallel jobs.", 2 * time.Minute},
-		{"human_wait", "Handoffs are stalling runs", "The harness reaches a human decision and stops its critical path.", "Front-load acceptance criteria and pre-approve safe tools for unattended runs.", 2 * time.Minute},
-		{"retry", "Verification is repeating", "The same verification command appears more than once in a session.", "Capture the first failure, run the narrowest affected test, and quarantine flakes.", time.Minute},
+		{"build_wait", "Compilation owns the critical path", "The agent stops between edits while a compiler or bundler runs.", "Cache and distribute the build: warm ccache/sccache, turn on remote or distributed compilation, and split targets so one edit rebuilds the minimum.", time.Minute},
+		{"test_wait", "Test execution owns the loop", "The agent is blocked on the suite before it can act on the result.", "Shard and parallelize the suite, run the narrowest affected tests first, and keep a fast subset for the inner loop.", time.Minute},
+		{"ci_wait", "CI is your longest feedback loop", "Runs are blocked on remote checks instead of continuing useful work.", "Mirror the slow gate locally and split independent checks into parallel jobs.", time.Minute},
+		{"container_wait", "Infrastructure spin-up is inside the loop", "Containers, clusters, or cloud resources are provisioned while the agent waits.", "Pre-bake images and keep a warm pool or a long-lived dev container between runs.", time.Minute},
+		{"dependency_wait", "Dependency fetches are inside the hot loop", "Package managers and registries are consuming agent time.", "Vendor or cache dependencies in the harness image and warm them before the agent starts.", time.Minute},
 		{"agent_wait", "Delegation is serializing", "A parent agent waits while delegated work runs.", "Fan out independent tasks together and keep a local task ready during joins.", time.Minute},
-		{"dependency_wait", "Setup is inside the hot loop", "Package or network work is consuming observed session time.", "Cache dependencies in the harness image and warm them before the agent starts.", time.Minute},
+		{"retry", "The same work is running twice", "A build, test, or CI command repeats inside one session, so the machine does the work more than once.", "Capture the first failure, rerun only the narrowest affected target, and quarantine flakes.", time.Minute},
 	}
 	var out []Finding
 	for _, item := range specs {
@@ -608,26 +663,33 @@ func buildFindings(totals map[string]time.Duration) []Finding {
 	return out
 }
 
-func activeDuration(segments []Segment) time.Duration {
-	var total time.Duration
+// machineTime is a session's observed time: everything except the stretches
+// where the agent was waiting on a person.
+func machineTime(segments []Segment) (total, blocked time.Duration) {
 	for _, segment := range segments {
-		if !isRecoverable(segment.Category) {
+		switch CategoryGroup(segment.Category) {
+		case GroupExcluded:
+		case GroupBlocked:
+			total += segment.Duration
+			blocked += segment.Duration
+		default:
 			total += segment.Duration
 		}
 	}
-	return total
+	return total, blocked
 }
 
-func isRecoverable(category string) bool {
-	switch category {
-	case "ci_wait", "agent_wait", "human_wait", "dependency_wait", "retry":
-		return true
-	default:
-		return false
-	}
-}
-
+// Claude and Cursor both key their trace directories by workspace under a
+// "projects" root, but nest the transcripts further down (Cursor by chat UUID).
+// Walking up to the segment under "projects" names the workspace instead of the
+// chat.
 func inferProject(file candidate) string {
+	parts := strings.Split(filepath.ToSlash(file.Path), "/")
+	for index, part := range parts {
+		if part == "projects" && index+1 < len(parts)-1 {
+			return cleanProject(parts[index+1])
+		}
+	}
 	dir := filepath.Dir(file.Path)
 	if file.Provider == "grok" {
 		dir = filepath.Dir(filepath.Dir(file.Path))
@@ -635,15 +697,17 @@ func inferProject(file candidate) string {
 	return cleanProject(filepath.Base(dir))
 }
 
+const unknownProject = "unknown"
+
 func cleanProject(raw string) string {
 	if raw == "" {
-		return "unknown"
+		return unknownProject
 	}
 	raw = strings.TrimPrefix(raw, "file://")
 	raw = strings.TrimRight(raw, "/"+string(filepath.Separator))
 	base := filepath.Base(raw)
 	if base == "." || base == string(filepath.Separator) || base == "" {
-		return "unknown"
+		return unknownProject
 	}
 	if strings.HasPrefix(base, "-") || strings.HasPrefix(base, "Users-") {
 		parts := strings.Split(strings.Trim(base, "-"), "-")
