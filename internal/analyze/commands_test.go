@@ -1,6 +1,9 @@
 package analyze
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestCommandInfraCatalog pins the infrastructure lens: containers, clusters,
 // cloud provisioning, remote CI and remote/distributed compile.
@@ -303,13 +306,410 @@ func TestCommandBuildPrefixIsAnchored(t *testing.T) {
 
 // TestCommandNoLegacyVerify guards the id rename: nothing may emit "verify".
 func TestCommandNoLegacyVerify(t *testing.T) {
-	for _, needles := range [][]string{ciNeedles, containerNeedles, buildNeedles, testNeedles, containerRunNeedles} {
+	lists := [][]string{
+		ciNeedles, containerNeedles, buildNeedles, buildHeadNeedles,
+		testNeedles, testHeadNeedles, containerRunNeedles,
+		dependencyNeedles, dependencyHeadNeedles,
+	}
+	for _, needles := range lists {
 		for _, needle := range needles {
 			category, _, _ := classifyCommand(needle + " x")
 			switch category {
 			case "verify", "tool_other":
 				t.Errorf("needle %q classified as %q", needle, category)
 			}
+		}
+	}
+}
+
+// TestCommandPrecedence pins the ordering decisions in bucketFor. Each case is a
+// command that more than one rule can claim; the comment is the reason the
+// winner wins. These are the assertions that break if the ladder is reordered.
+func TestCommandPrecedence(t *testing.T) {
+	cases := []struct {
+		command string
+		want    string
+		why     string
+	}{
+		{"gh run watch 12 && cargo build --release", "ci_wait", "a hosted pipeline poll outranks the local build it mentions"},
+		{"docker build -t api .", "build_wait", "an image build of source is a compile, not a container start"},
+		{"docker run --rm api pytest -q", "test_wait", "the payload decides: a containerized test run is a test wait"},
+		{"kubectl exec -it api -- pytest tests/", "test_wait", "same payload rule for pods"},
+		{"docker compose up -d", "container_wait", "nothing runs inside it; the infrastructure is the wait"},
+		{"packer build image.pkr.hcl", "container_wait", "packer boots cloud VMs and compiles no source"},
+		{"cargo test --all-features", "test_wait", "a cargo build needle must not swallow cargo test"},
+		{"make test", "test_wait", "a conventional test target beats the bare make build prefix"},
+		{"zig build test", "test_wait", "same, for zig's build-system test step"},
+		{"xcodebuild test -scheme AppTests", "test_wait", "same, for xcodebuild"},
+		{"go build ./... && go test ./...", "test_wait", "in a build+test chain the wall clock sits in the test"},
+		{"bazel test //... --remote_executor=grpc://rbe", "test_wait", "remote execution of a test suite is still a test wait"},
+		{"mvn dependency:go-offline", "dependency_wait", "a registry fetch beats the bare mvn build prefix"},
+		{"terraform init -upgrade", "dependency_wait", "init downloads providers; it provisions nothing"},
+		{"terraform apply -auto-approve", "container_wait", "apply is the provisioning wait"},
+		{"./gradlew build --refresh-dependencies", "build_wait", "the compile still happens; the flag does not demote it"},
+		{"curl -sf http://localhost:8080/healthz", "test_wait", "loopback is the agent checking its own server"},
+		{"curl -sSL https://registry.example.com/pkg.tgz", "dependency_wait", "a real remote fetch stays a dependency wait"},
+		{"until kubectl get pods | grep -q running; do sleep 2; done", "container_wait", "poll primitive plus infra target"},
+		{"docker --version", "explore", "a sub-second capability probe is not a container wait"},
+		{"npm run lint", "test_wait", "the script name decides, not the package manager"},
+		{"npm run dev", "tool_other", "a dev server is a local process, not a wait on someone else's compute"},
+	}
+
+	for _, testCase := range cases {
+		got, _, _ := classifyCommand(testCase.command)
+		if got != testCase.want {
+			t.Errorf("classifyCommand(%q) = %q, want %q (%s)", testCase.command, got, testCase.want, testCase.why)
+		}
+	}
+}
+
+// TestCommandDependencyCatalog covers the package-manager and network lens.
+func TestCommandDependencyCatalog(t *testing.T) {
+	cases := map[string]string{
+		"npm install":                         "dependency_wait",
+		"npm ci --prefer-offline":             "dependency_wait",
+		"pnpm add -D vitest":                  "dependency_wait",
+		"yarn install --frozen-lockfile":      "dependency_wait",
+		"bun install":                         "dependency_wait",
+		"pip install -r requirements.txt":     "dependency_wait",
+		"uv sync --frozen":                    "dependency_wait",
+		"uv lock":                             "dependency_wait",
+		"poetry lock --no-update":             "dependency_wait",
+		"conda env create -f environment.yml": "dependency_wait",
+		"apk add --no-cache git":              "dependency_wait",
+		"apt-get install -y build-essential":  "dependency_wait",
+		"brew install ripgrep":                "dependency_wait",
+		"gem install bundler":                 "dependency_wait",
+		"composer update":                     "dependency_wait",
+		"cargo fetch":                         "dependency_wait",
+		"cargo vendor":                        "dependency_wait",
+		"go mod tidy":                         "dependency_wait",
+		"rustup component add clippy":         "dependency_wait",
+		"mise install":                        "dependency_wait",
+		"git clone https://github.com/x/y":    "dependency_wait",
+		"git ls-remote --heads origin":        "dependency_wait",
+		"git submodule update --init":         "dependency_wait",
+		"scp build.tar host:/tmp":             "dependency_wait",
+		"docker pull alpine:3":                "dependency_wait",
+		"ollama pull llama3":                  "dependency_wait",
+		"huggingface-cli download org/model":  "dependency_wait",
+		"aws s3 sync ./dist s3://bucket":      "dependency_wait",
+		"helm repo update":                    "dependency_wait",
+		"go list -m -u all":                   "dependency_wait",
+
+		// registry *reads* that return immediately are exploration, not a wait.
+		"npm view react version": "explore",
+		"pip list":               "explore",
+		"cargo tree":             "explore",
+		"command -v rg":          "explore",
+		"uv --version":           "explore",
+	}
+
+	for command, want := range cases {
+		got, _, _ := classifyCommand(command)
+		if got != want {
+			t.Errorf("classifyCommand(%q) = %q, want %q", command, got, want)
+		}
+	}
+}
+
+// TestCommandNegatives is the false-positive wall. Every entry is a real shape
+// from agent traces where a needle appears inside text the agent is printing,
+// searching, editing or naming -- never inside work the machine is doing. A
+// wrong answer here silently mislabels the user's own data, which is worse than
+// missing the command entirely.
+func TestCommandNegatives(t *testing.T) {
+	blocked := set("build_wait", "test_wait", "ci_wait", "container_wait", "dependency_wait")
+	commands := []string{
+		// the command as an argument to a printer or a searcher.
+		"echo go build",
+		"echo 'npm install && npm test'",
+		"printf 'docker compose up\\n' >> docs/setup.txt",
+		"rg 'pip install' README.md",
+		"grep -rn 'uv sync' docs/",
+		"grep -rn 'cargo build' .github/workflows/ci.yml",
+		"sed -n '1,40p' Dockerfile",
+		"sed -n '1,60p' docker-compose.yml",
+		"cat .gitlab-ci.yml",
+		"head -20 Makefile",
+		"awk '/go test/ {print}' notes.md",
+		// prose that happens to start with a build tool.
+		"make sure the tests pass before pushing",
+		"echo 'make sure the scan state is reachable'",
+		// paths and identifiers that contain a tool name.
+		"ls /opt/docker-compose-backup",
+		"ls node_modules/.bin/esbuild",
+		"cat vitest.config.ts",
+		"cat jest.config.js",
+		"cat .eslintrc.json",
+		"cat webpack.config.js",
+		"git log --author=travis --oneline -5",
+		"gh pr view 22637 --json statusCheckRollup",
+		// English words that contain a tool or verb name.
+		"rg 'await connection' src/",
+		"rg -n 'artifact|compact|transact' internal/",
+		"echo 'the flag is threaded across build and test lanes'",
+		"python3 -c 'from unittest.mock import MagicMock'",
+		// probes and reads of the very tools above.
+		"docker compose --version",
+		"terraform validate",
+		"helm template ./chart",
+	}
+
+	for _, command := range commands {
+		got, _, _ := classifyCommand(command)
+		if blocked[got] {
+			t.Errorf("classifyCommand(%q) = %q, want a non-blocking category", command, got)
+		}
+	}
+}
+
+// TestCommandNormalization proves the rewrites that happen before any needle is
+// scanned. Each pair must land in the same bucket as its bare form.
+func TestCommandNormalization(t *testing.T) {
+	cases := map[string]string{
+		// git global flags hide the subcommand from every git needle.
+		"git -C /srv/repo fetch --all":                  "dependency_wait",
+		"git -C /srv/repo status --short":               "explore",
+		"git -c user.name=ci commit -m wip":             "edit",
+		"git --git-dir=/srv/repo/.git push origin main": "dependency_wait",
+		// leading environment assignments.
+		"ISLO_ENV=local uv run pytest -q":             "test_wait",
+		"CGO_ENABLED=0 GOOS=linux go build ./cmd/app": "build_wait",
+		// runner prefixes carry no information of their own.
+		"uv run ruff check src":         "test_wait",
+		"npx jest --runInBand":          "test_wait",
+		"pnpm exec vitest run":          "test_wait",
+		"poetry run pytest tests/unit":  "test_wait",
+		"bundle exec rspec spec/models": "test_wait",
+		// wrappers and cd hops.
+		"cd /repo && sudo make -j8 all":            "build_wait",
+		"bash -lc 'cd /repo/api && go test ./...'": "test_wait",
+		"time cargo build --release":               "build_wait",
+	}
+
+	for command, want := range cases {
+		got, _, _ := classifyCommand(command)
+		if got != want {
+			t.Errorf("classifyCommand(%q) = %q, want %q", command, got, want)
+		}
+	}
+}
+
+// TestCommandRetryKeys pins the dedup key: it exists for exactly the buckets
+// where doing the same work twice is waste the user can act on, and it survives
+// the formatting differences that make the same command look different.
+func TestCommandRetryKeys(t *testing.T) {
+	keyed := map[string]string{
+		"go test ./...":         "test_wait",
+		"cargo build --release": "build_wait",
+		"gh run watch 12":       "ci_wait",
+	}
+	for command, category := range keyed {
+		got, _, key := classifyCommand(command)
+		if got != category {
+			t.Fatalf("classifyCommand(%q) = %q, want %q", command, got, category)
+		}
+		if key == "" {
+			t.Errorf("classifyCommand(%q) produced no retry key for %q", command, category)
+		}
+	}
+
+	unkeyed := []string{
+		"docker compose up -d", // restarting a stack is normal, not waste
+		"npm install",          // so is installing twice in two worktrees
+		"kubectl apply -f k8s/",
+		"cat README.md",
+		"git commit -m wip",
+	}
+	for _, command := range unkeyed {
+		category, _, key := classifyCommand(command)
+		if key != "" {
+			t.Errorf("classifyCommand(%q) = %q with key %q, want no key", command, category, key)
+		}
+	}
+
+	// The key is built from the normalized command, so formatting cannot split
+	// one repeated command into two distinct keys.
+	base := keyOf(t, "go test ./internal/...")
+	for _, variant := range []string{
+		"GO TEST ./internal/...",
+		"cd /repo && go   test ./internal/...",
+		"GOFLAGS=-count=1 go test ./internal/...",
+		"bash -lc 'go test ./internal/...'",
+	} {
+		if got := keyOf(t, variant); got != base {
+			t.Errorf("key(%q) = %q, want %q", variant, got, base)
+		}
+	}
+
+	// Two long commands under a shared path prefix must not collide once the
+	// key is truncated: that collision reports unrelated work as a retry.
+	prefix := "go test github.com/example/monorepo/services/platform/ingestion/pipeline/internal/"
+	first := keyOf(t, prefix+"transform/stage_one -run TestPipelineTransformsRecordsEndToEnd -count=1")
+	second := keyOf(t, prefix+"transform/stage_two -run TestPipelineTransformsRecordsEndToEnd -count=1")
+	if first == second {
+		t.Error("two different long test commands share a retry key")
+	}
+}
+
+func keyOf(t *testing.T, command string) string {
+	t.Helper()
+	_, _, key := classifyCommand(command)
+	if key == "" {
+		t.Fatalf("classifyCommand(%q) produced no key", command)
+	}
+	return key
+}
+
+// TestShellActionJSWrapper covers Codex's `exec` tool, which carries a
+// JavaScript program instead of a command string.
+func TestShellActionJSWrapper(t *testing.T) {
+	batch := `const [a, b, c] = await Promise.all([
+  tools.exec_command({ cmd: "git status --short && git rev-parse HEAD" }),
+  tools.exec_command({cmd:"gh pr view 22637"}),
+  tools.exec_command({cmd: "gh pr checks 22637"}),
+]);`
+	got := toolAction("exec", map[string]any{"command": batch})
+	if got.Category != "ci_wait" {
+		t.Errorf("batch category = %q, want ci_wait (the batch blocks until its slowest leg settles)", got.Category)
+	}
+	if got.Key == "" || strings.Contains(got.Key, "tools.exec_command") {
+		t.Errorf("batch key = %q, want the extracted commands and no JS boilerplate", got.Key)
+	}
+	if !strings.Contains(got.Key, "gh pr checks 22637") {
+		t.Errorf("batch key = %q, want every leg represented", got.Key)
+	}
+
+	// The same command written with different spacing must produce one key.
+	spaced := toolAction("exec", map[string]any{"command": `await tools.exec_command({ cmd: "cargo test --all" })`})
+	tight := toolAction("exec", map[string]any{"command": `await tools.exec_command({cmd:"cargo test --all"})`})
+	if spaced.Key != tight.Key || spaced.Key == "" {
+		t.Errorf("keys differ across JS spacing: %q vs %q", spaced.Key, tight.Key)
+	}
+	if spaced.Category != "test_wait" {
+		t.Errorf("category = %q, want test_wait", spaced.Category)
+	}
+
+	// A command past the 400-char needle window is still classified: extraction
+	// happens before the window is applied.
+	padded := "// " + strings.Repeat("x", 600) + "\nawait tools.exec_command({cmd: \"cargo build --release\"});"
+	if got := toolAction("exec", map[string]any{"command": padded}); got.Category != "build_wait" {
+		t.Errorf("padded batch category = %q, want build_wait", got.Category)
+	}
+
+	// Escapes survive the round trip.
+	escaped := `await tools.exec_command({cmd: "pytest -k \"not slow\" tests/"})`
+	if got := toolAction("exec", map[string]any{"command": escaped}); got.Category != "test_wait" {
+		t.Errorf("escaped batch category = %q, want test_wait", got.Category)
+	}
+
+	// exec_command itself carries clean JSON arguments and must never be
+	// re-parsed as a program.
+	if got := toolAction("exec_command", map[string]any{"command": "cargo test --all"}); got.Category != "test_wait" {
+		t.Errorf("exec_command category = %q, want test_wait", got.Category)
+	}
+	// A shell tool is never treated as a program, so a quoted cmd: in a shell
+	// string cannot be lifted out of its quotes.
+	if got := toolAction("bash", map[string]any{"command": `echo 'cmd: "cargo build"'`}); got.Category == "build_wait" {
+		t.Error("a quoted cmd: inside a shell echo must not be extracted")
+	}
+}
+
+// TestShellActionJSWrapperIsSafe covers adversarial payloads: extraction is a
+// bounded regex over a bounded string, so nothing here may panic or hang.
+func TestShellActionJSWrapperIsSafe(t *testing.T) {
+	payloads := []string{
+		`await tools.exec_command({cmd: "go test ./...`,               // unterminated literal
+		"await tools.exec_command({cmd: `sed -n '1,${n}p' ${file}`})", // template literal
+		`await tools.exec_command({cmd: someVariable})`,               // indirection
+		`const cmd = {}; cmd: cmd: cmd: "x"`,                          // degenerate
+		strings.Repeat(`await tools.exec_command({cmd:"go test ./..."});`, 5000),
+		strings.Repeat(`{cmd:"`, 50000),
+		"",
+	}
+	for _, payload := range payloads {
+		got := toolAction("exec", map[string]any{"command": payload})
+		if got.Kind != kindToolCall {
+			t.Errorf("payload %.30q produced kind %v", payload, got.Kind)
+		}
+	}
+	if commands := extractShellCommands(strings.Repeat(`{cmd:"go build"},`, 100)); len(commands) > maxJSCommands {
+		t.Errorf("extracted %d commands, want at most %d", len(commands), maxJSCommands)
+	}
+}
+
+// TestToolActionBlockedOnBackgroundProcess pins the wait / write_stdin
+// decision. Both block on a process the agent started, but which compute is
+// only knowable by correlating session_id with the exec_command that started
+// it -- state this classifier does not have. They are therefore labelled as a
+// wait and left out of the wasted-cycle buckets: under-count, never lie.
+func TestToolActionBlockedOnBackgroundProcess(t *testing.T) {
+	for _, tool := range []string{"wait", "write_stdin", "writeStdin"} {
+		got := toolAction(tool, map[string]any{"session_id": 77173, "yield_time_ms": 1000})
+		if got.Category != "tool_other" {
+			t.Errorf("toolAction(%q) = %q, want tool_other", tool, got.Category)
+		}
+		if got.Label != "blocked on background process" {
+			t.Errorf("toolAction(%q) label = %q, want it to read as a wait", tool, got.Label)
+		}
+		if got.Key != "" {
+			t.Errorf("toolAction(%q) must not carry a retry key", tool)
+		}
+	}
+}
+
+// TestToolActionCategoryCoverage checks that every category this file is
+// allowed to emit is actually reachable, and that it emits nothing else.
+func TestToolActionCategoryCoverage(t *testing.T) {
+	allowed := set("reasoning", "explore", "edit", "tool_other", "build_wait", "test_wait", "ci_wait", "container_wait", "dependency_wait", "agent_wait")
+	seen := map[string]bool{}
+
+	for tool, input := range map[string]map[string]any{
+		"read":      nil,
+		"edit_file": nil,
+		"task":      nil,
+		"todowrite": nil,
+		"wait":      nil,
+	} {
+		seen[toolAction(tool, input).Category] = true
+	}
+	for _, command := range []string{
+		"cargo build --release", "go test ./...", "gh run watch 1",
+		"docker compose up -d", "npm install", "cat README.md",
+		"git commit -m wip", "hostname",
+	} {
+		category, _, _ := classifyCommand(command)
+		seen[category] = true
+	}
+
+	for category := range seen {
+		if !allowed[category] {
+			t.Errorf("emitted unknown category %q", category)
+		}
+	}
+	for category := range allowed {
+		if !seen[category] {
+			t.Errorf("category %q is unreachable", category)
+		}
+	}
+}
+
+// TestCommandLocalChecks pins the two escape hatches for commands that name a
+// heavy tool but return immediately.
+func TestCommandLocalChecks(t *testing.T) {
+	cases := map[string]string{
+		"ansible-playbook site.yml --syntax-check": "explore",
+		"helm upgrade api ./chart --dry-run":       "explore",
+		"kubectl apply -f k8s/ --dry-run=client":   "explore",
+		"terraform --version":                      "explore",
+		"docker buildx --help":                     "explore",
+		"command -v uv":                            "explore",
+	}
+	for command, want := range cases {
+		got, _, _ := classifyCommand(command)
+		if got != want {
+			t.Errorf("classifyCommand(%q) = %q, want %q", command, got, want)
 		}
 	}
 }
