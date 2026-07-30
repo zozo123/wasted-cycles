@@ -30,7 +30,7 @@ or upload.
 - What is the highest-impact bottleneck to fix next?
 
 Use the arrow keys to switch between Overview, Histogram, Runs, and Method.
-Press `7`, `0`, or `y` to switch the lookback window. Press `q` to quit.
+Press `W`, `M`, or `Y` to switch the lookback window. Press `q` to quit.
 
 ```sh
 # Explore with a realistic built-in dataset
@@ -60,8 +60,9 @@ curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
 | `--no-alt-screen` | Render without the terminal alternate screen |
 | `--version` | Print the version |
 
-In the TUI, press `7`, `0`, or `y` (or `[` / `]`) to switch between **7d**, **30d**,
-and **YTD** without restarting. The header chips show the active window.
+In the TUI, press `W` (week), `M` (month), or `Y` (YTD) — or `[` / `]` — to switch
+between **7d**, **30d**, and **YTD** without restarting. The header chips show the
+active window.
 
 The TUI is used when stdout is a terminal. Piped or redirected output falls
 back to the plain-text summary automatically, so `wasted-cycles > report.txt`

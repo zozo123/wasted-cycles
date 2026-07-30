@@ -132,10 +132,10 @@ func TestRangeKeysRescan(t *testing.T) {
 			return report, nil
 		},
 	})
-	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'0'}})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
 	view := updated.(Model)
 	if view.window != analyze.Window30d || !view.loading || cmd == nil {
-		t.Fatalf("pressing 0 should start a 30d rescan, got window=%s loading=%v cmd=%v", view.window, view.loading, cmd)
+		t.Fatalf("pressing M should start a 30d rescan, got window=%s loading=%v cmd=%v", view.window, view.loading, cmd)
 	}
 	msg := cmd()
 	scanned, ok := msg.(scannedMsg)
