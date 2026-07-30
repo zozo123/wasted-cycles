@@ -17,6 +17,7 @@ import (
 
 type Options struct {
 	Since    time.Time
+	Window   Window
 	MaxGap   time.Duration
 	IdleGap  time.Duration
 	MaxFiles int
@@ -73,6 +74,7 @@ type Source struct {
 type Report struct {
 	GeneratedAt time.Time     `json:"generated_at"`
 	Since       time.Time     `json:"since"`
+	Window      Window        `json:"window,omitempty"`
 	Observed    time.Duration `json:"observed_ns"`
 	Blocked     time.Duration `json:"blocked_ns"`
 	Human       time.Duration `json:"human_ns"`
@@ -163,7 +165,12 @@ func (o Options) withDefaults() Options {
 		o.IdleGap = max(2*time.Hour, 4*o.MaxGap)
 	}
 	if o.MaxFiles <= 0 {
-		o.MaxFiles = 600
+		// High enough that a full YTD walk across Codex + Claude + Grok does
+		// not silently drop older harnesses; Skipped still surfaces the rest.
+		o.MaxFiles = 10000
+	}
+	if o.Since.IsZero() && o.Window.Valid() {
+		o.Since = o.Window.Since(time.Now())
 	}
 	if o.Workers <= 0 {
 		o.Workers = runtime.NumCPU()
@@ -186,7 +193,13 @@ func Run(opts Options) (Report, error) {
 		candidates = candidates[:opts.MaxFiles]
 	}
 
-	report := Report{GeneratedAt: time.Now(), Since: opts.Since, Skipped: skipped, Scanned: len(candidates)}
+	report := Report{
+		GeneratedAt: time.Now(),
+		Since:       opts.Since,
+		Window:      opts.Window,
+		Skipped:     skipped,
+		Scanned:     len(candidates),
+	}
 	for _, session := range parseAll(candidates, opts) {
 		report.Sessions = append(report.Sessions, session)
 	}
@@ -244,6 +257,7 @@ func discover(home string, since time.Time) []candidate {
 	}{
 		{"codex", filepath.Join(home, ".codex", "sessions")},
 		{"claude", filepath.Join(home, ".claude", "projects")},
+		{"cursor", filepath.Join(home, ".cursor", "projects")},
 		{"grok", filepath.Join(home, ".grok", "sessions")},
 	}
 	var out []candidate
@@ -268,6 +282,11 @@ func discover(home string, since time.Time) []candidate {
 			if root.Provider == "grok" && name != "updates.jsonl" {
 				return nil
 			}
+			// Cursor drops assorted JSONL sidecars next to the real transcripts;
+			// only agent-transcripts carry the turn timestamps we can use.
+			if root.Provider == "cursor" && !strings.Contains(filepath.ToSlash(path), "/agent-transcripts/") {
+				return nil
+			}
 			info, err := entry.Info()
 			if err != nil || !info.Mode().IsRegular() || info.ModTime().Before(since) {
 				return nil
@@ -281,7 +300,7 @@ func discover(home string, since time.Time) []candidate {
 
 func skipDir(name string) bool {
 	switch name {
-	case "subagents", "node_modules", ".git", "shell-snapshots", "statsig":
+	case "subagents", "node_modules", ".git", "shell-snapshots", "statsig", "mcps", "terminals":
 		return true
 	}
 	return false
@@ -289,9 +308,20 @@ func skipDir(name string) bool {
 
 func parseSession(file candidate, opts Options) (Session, bool) {
 	opts = opts.withDefaults()
-	events, project, resolution := readEvents(file)
-	if len(events) < 2 && file.Provider == "grok" {
-		events, resolution = grokBoundaryEvents(file.Path), resolutionTurn
+	var (
+		events     []event
+		project    string
+		resolution = resolutionEvent
+	)
+	switch file.Provider {
+	case "cursor":
+		events, project = cursorEvents(file.Path)
+		resolution = resolutionTurn
+	default:
+		events, project, resolution = readEvents(file)
+		if len(events) < 2 && file.Provider == "grok" {
+			events, resolution = grokBoundaryEvents(file.Path), resolutionTurn
+		}
 	}
 	if len(events) < 2 {
 		return Session{}, false
@@ -303,7 +333,7 @@ func parseSession(file candidate, opts Options) (Session, bool) {
 	}
 
 	id := strings.TrimSuffix(filepath.Base(file.Path), filepath.Ext(file.Path))
-	if file.Provider == "grok" {
+	if file.Provider == "grok" || file.Provider == "cursor" {
 		id = filepath.Base(filepath.Dir(file.Path))
 	}
 	project = cleanProject(project)

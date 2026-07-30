@@ -13,7 +13,7 @@ func Plain(report analyze.Report) string {
 	var lines []string
 	add := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 
-	scope := fmt.Sprintf("last %s · %d traces", relativePeriod(report.Since), report.Scanned)
+	scope := fmt.Sprintf("%s · %d traces", windowLabel(report), report.Scanned)
 	if report.IsDemo {
 		scope = "demo dataset"
 	}
@@ -22,7 +22,7 @@ func Plain(report analyze.Report) string {
 	if len(report.Sessions) == 0 {
 		add("No recent supported traces found in ~/.codex/sessions, ~/.claude/projects,")
 		add("~/.cursor/projects, or ~/.grok/sessions.")
-		add("Widen the window with --days 30, or see the interface with --demo.")
+		add("Widen the window with --days 30 or --ytd, or see the interface with --demo.")
 		return strings.Join(lines, "\n")
 	}
 

@@ -25,7 +25,7 @@ func TestViewNeverPanicsAcrossTerminalSizes(t *testing.T) {
 	for name, report := range reports() {
 		for _, size := range sizes {
 			for tab := tabOverview; tab <= tabMethod; tab++ {
-				model, _ := New(report, "test").Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+				model, _ := New(report, "test", Config{}).Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
 				view := model.(Model)
 				view.tab = tab
 				func() {
@@ -49,7 +49,7 @@ func TestNoRenderedLineExceedsTheTerminal(t *testing.T) {
 	for name, report := range reports() {
 		for _, width := range []int{68, 74, 80, 100, 140} {
 			for tab := tabOverview; tab <= tabMethod; tab++ {
-				model, _ := New(report, "test").Update(tea.WindowSizeMsg{Width: width, Height: 40})
+				model, _ := New(report, "test", Config{}).Update(tea.WindowSizeMsg{Width: width, Height: 40})
 				view := model.(Model)
 				view.tab = tab
 				for index, line := range strings.Split(view.View(), "\n") {
@@ -64,7 +64,7 @@ func TestNoRenderedLineExceedsTheTerminal(t *testing.T) {
 }
 
 func TestTabNavigationWraps(t *testing.T) {
-	model := New(analyze.DemoReport(), "test")
+	model := New(analyze.DemoReport(), "test", Config{})
 	next, _ := model.Update(tea.KeyMsg{Type: tea.KeyLeft})
 	if got := next.(Model).tab; got != tabMethod {
 		t.Fatalf("left from the first tab should wrap to the last, got %d", got)
@@ -85,7 +85,7 @@ func TestQuitKeys(t *testing.T) {
 		{Type: tea.KeyCtrlC},
 		{Type: tea.KeyEsc},
 	} {
-		if _, cmd := New(analyze.DemoReport(), "test").Update(key); cmd == nil {
+		if _, cmd := New(analyze.DemoReport(), "test", Config{}).Update(key); cmd == nil {
 			t.Fatalf("%s should quit", key)
 		}
 	}
@@ -108,7 +108,7 @@ func TestTruncateIsRuneSafe(t *testing.T) {
 
 func TestPlainSummary(t *testing.T) {
 	output := Plain(analyze.DemoReport())
-	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "RUNS", "turn resolution"} {
+	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "RUNS", "turn resolution", "cursor"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("plain output is missing %q:\n%s", want, output)
 		}
@@ -116,6 +116,43 @@ func TestPlainSummary(t *testing.T) {
 	empty := Plain(analyze.Report{Since: time.Now().Add(-24 * time.Hour)})
 	if !strings.Contains(empty, "No recent supported traces") {
 		t.Fatalf("empty report should explain itself:\n%s", empty)
+	}
+}
+
+func TestRangeKeysRescan(t *testing.T) {
+	calls := 0
+	model := New(analyze.DemoReport(), "test", Config{
+		Window: analyze.Window7d,
+		Scan: func(window analyze.Window) (analyze.Report, error) {
+			calls++
+			report := analyze.DemoReport()
+			report.Window = window
+			report.Since = window.Since(time.Now())
+			report.Scanned = 42
+			return report, nil
+		},
+	})
+	updated, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'0'}})
+	view := updated.(Model)
+	if view.window != analyze.Window30d || !view.loading || cmd == nil {
+		t.Fatalf("pressing 0 should start a 30d rescan, got window=%s loading=%v cmd=%v", view.window, view.loading, cmd)
+	}
+	msg := cmd()
+	scanned, ok := msg.(scannedMsg)
+	if !ok || scanned.err != nil || scanned.window != analyze.Window30d {
+		t.Fatalf("unexpected scan result: %#v", msg)
+	}
+	final, _ := view.Update(scanned)
+	done := final.(Model)
+	if done.loading || done.report.Scanned != 42 || done.window != analyze.Window30d {
+		t.Fatalf("after scan: loading=%v scanned=%d window=%s", done.loading, done.report.Scanned, done.window)
+	}
+	if calls != 1 {
+		t.Fatalf("scan called %d times", calls)
+	}
+	rendered := done.View()
+	if !strings.Contains(ansi.Strip(rendered), "30d") {
+		t.Fatalf("view should show the 30d chip:\n%s", ansi.Strip(rendered))
 	}
 }
 

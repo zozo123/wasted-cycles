@@ -481,8 +481,8 @@
     </div>
 
     <p class="note" style="margin-top: 1rem;">
-      In the terminal the same data is a live TUI: arrow keys switch between Overview,
-      Histogram, Runs, and Method; <code>q</code> quits.
+      In the terminal the same data is a live TUI: arrow keys switch views, <code>7</code> /
+      <code>0</code> / <code>y</code> change the lookback window, and <code>q</code> quits.
     </p>
   </section>
 
@@ -496,7 +496,8 @@
         <tbody>
           <tr><td>Codex</td><td class="src">~/.codex/sessions</td><td>per event</td></tr>
           <tr><td>Claude Code</td><td class="src">~/.claude/projects</td><td>per event</td></tr>
-          <tr><td>Grok Build</td><td class="src">~/.grok/sessions</td><td>per turn</td></tr>
+          <tr><td>Cursor</td><td class="src">~/.cursor/projects/*/agent-transcripts</td><td>per turn</td></tr>
+          <tr><td>Grok Build</td><td class="src">~/.grok/sessions</td><td>per session</td></tr>
         </tbody>
       </table>
     </div>
@@ -505,12 +506,9 @@
       written back, and nothing leaves the machine.
     </p>
     <p class="note" style="margin-top: 0.6rem;">
-      <strong>Cursor is not supported.</strong> Its transcripts carry no per-event timestamps,
-      only a wall-clock marker on each user turn, and time reconstructed from those markers
-      cannot separate work from idling — on a real corpus it reported a scheduled agent that
-      ticked every 30 minutes for five days as 120 hours of continuous work. A number that
-      wrong is worse than no number, so Cursor traces are skipped until the harness records
-      event times.
+      Cursor only stamps wall-clock time on user turns, so each segment spans a whole turn.
+      Scheduled Cursor agents that tick on a fixed interval are detected and dropped — the
+      pattern that once inflated a session to 120 hours of phantom work.
     </p>
   </section>
 
@@ -538,9 +536,10 @@
     </p>
     <p>
       Harnesses record different things. Codex and Claude Code stamp individual events.
-      Cursor transcripts carry no per-event timestamps, so its runs are reconstructed per
-      user turn and each turn takes the dominant tool category observed inside it; those
-      runs are marked <code>turn</code> on the Runs screen and carry low confidence. Grok Build
+      Cursor transcripts only stamp wall-clock time on user turns, so its runs are
+      reconstructed per turn and each turn takes the most blocking tool category observed
+      inside it; those runs are marked <code>turn</code> on the Runs screen and carry lower
+      confidence. Scheduled Cursor agents that tick on a fixed interval are dropped. Grok Build
       records only a session start and end, so a Grok run collapses to a single coarse block
       and is marked <code>turn</code> too. Records the profiler cannot identify are skipped
       instead of guessed.
@@ -574,14 +573,20 @@
     <div class="flags">
       <div class="flag"><code>--demo</code><span>Open the TUI with the built-in synthetic dataset — no traces required.</span></div>
       <div class="flag"><code>--days N</code><span>Size of the window to scan, in days. Defaults to 7.</span></div>
+      <div class="flag"><code>--ytd</code><span>Scan from January 1 of this year.</span></div>
       <div class="flag"><code>--json</code><span>Print the report as JSON instead of opening the TUI.</span></div>
       <div class="flag"><code>--plain</code><span>Print a plain-text summary instead of the TUI. Used automatically when output is piped or redirected.</span></div>
       <div class="flag"><code>--no-alt-screen</code><span>Render without the terminal alternate screen.</span></div>
       <div class="flag"><code>--version</code><span>Print the version and exit.</span></div>
     </div>
+    <p class="note" style="margin-top: 0.85rem;">
+      In the TUI, press <code>7</code>, <code>0</code>, or <code>y</code> (or <code>[</code> /
+      <code>]</code>) to switch between 7d, 30d, and YTD without restarting.
+    </p>
     <div class="cmd-wrap" style="margin-top: 1.25rem;">
 <pre><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --demo
 <span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --days 30
+<span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --ytd --plain
 <span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --json</pre>
     </div>
   </section>
