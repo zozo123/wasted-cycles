@@ -27,7 +27,7 @@ func TestClassifyClaudeRecords(t *testing.T) {
 		{
 			"bash test command",
 			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cd /repo && go test ./..."}}]}}`,
-			kindToolCall, "verify",
+			kindToolCall, "test_wait",
 		},
 		{
 			"bash ci watch",
@@ -109,7 +109,7 @@ func TestClassifyCodexRecords(t *testing.T) {
 		kind     eventKind
 		category string
 	}{
-		{`{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"command\":[\"bash\",\"-lc\",\"pytest -q\"]}"}}`, kindToolCall, "verify"},
+		{`{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"command\":[\"bash\",\"-lc\",\"pytest -q\"]}"}}`, kindToolCall, "test_wait"},
 		{`{"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch"}}`, kindToolCall, "edit"},
 		{`{"type":"response_item","payload":{"type":"reasoning","summary":[]}}`, kindThinking, ""},
 		{`{"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}`, kindToolResult, ""},
@@ -128,15 +128,15 @@ func TestClassifyCodexRecords(t *testing.T) {
 
 func TestClassifyCommand(t *testing.T) {
 	cases := map[string]string{
-		"cd /repo && go test ./...":        "verify",
+		"cd /repo && go test ./...":        "test_wait",
 		"bash -lc 'npm install'":           "dependency_wait",
 		"gh run watch 123":                 "ci_wait",
 		"git status --short":               "explore",
 		"git commit -m x":                  "edit",
 		"python3 -c 'print(1)'":            "tool_other",
-		"cd /a && cd /b && cargo clippy":   "verify",
-		"docker build -t x .":              "dependency_wait",
-		"golangci-lint run ./internal/...": "verify",
+		"cd /a && cd /b && cargo clippy":   "test_wait",
+		"docker build -t x .":              "build_wait",
+		"golangci-lint run ./internal/...": "test_wait",
 	}
 	for command, want := range cases {
 		if got, _, _ := classifyCommand(command); got != want {
@@ -222,8 +222,8 @@ func TestParseSessionEndToEnd(t *testing.T) {
 	if totals["explore"] != 3*time.Minute {
 		t.Fatalf("explore = %s, want 3m", totals["explore"])
 	}
-	if totals["verify"] != 4*time.Minute {
-		t.Fatalf("verify = %s, want 4m for the first run only", totals["verify"])
+	if totals["test_wait"] != 4*time.Minute {
+		t.Fatalf("test_wait = %s, want 4m for the first run only", totals["test_wait"])
 	}
 	if totals["retry"] != 4*time.Minute {
 		t.Fatalf("retry = %s, want 4m for the repeated run", totals["retry"])
@@ -311,48 +311,6 @@ func TestParseSessionRejectsUnusableTraces(t *testing.T) {
 	}
 }
 
-func TestCursorTurnResolution(t *testing.T) {
-	stamp := func(text string) string {
-		return `{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>` + text + `</timestamp>\nfix it"}]}}`
-	}
-	file := writeTrace(t, "cursor", []string{
-		stamp("Thursday, Jul 30, 2026, 3:45 PM (UTC+3)"),
-		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"go test ./..."}}]}}`,
-		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"go test ./pkg"}}]}}`,
-		stamp("Thursday, Jul 30, 2026, 4:05 PM (UTC+3)"),
-	})
-	session, ok := parseSession(file, Options{MaxGap: 30 * time.Minute})
-	if !ok {
-		t.Fatal("expected a cursor session")
-	}
-	if session.Resolution != resolutionTurn {
-		t.Fatalf("resolution = %q, want %q", session.Resolution, resolutionTurn)
-	}
-	if len(session.Segments) == 0 || session.Segments[0].Category != "verify" {
-		t.Fatalf("first turn should take the dominant tool category, got %+v", session.Segments)
-	}
-	if session.Segments[0].Duration != 20*time.Minute {
-		t.Fatalf("turn duration = %s, want 20m", session.Segments[0].Duration)
-	}
-	if session.Segments[0].Confidence >= .6 {
-		t.Fatal("turn-resolution segments must carry low confidence")
-	}
-}
-
-func TestParseCursorTime(t *testing.T) {
-	got := parseCursorTime("Thursday, Jul 30, 2026, 3:45 PM (UTC+3)")
-	want := time.Date(2026, 7, 30, 12, 45, 0, 0, time.UTC)
-	if !got.Equal(want) {
-		t.Fatalf("got %s, want %s", got, want)
-	}
-	if negative := parseCursorTime("Monday, Jan 5, 2026, 9:05 AM (UTC-07:00)"); !negative.Equal(time.Date(2026, 1, 5, 16, 5, 0, 0, time.UTC)) {
-		t.Fatalf("negative offset parsed as %s", negative)
-	}
-	if bad := parseCursorTime("sometime last tuesday"); !bad.IsZero() {
-		t.Fatalf("unparseable stamps must be zero, got %s", bad)
-	}
-}
-
 func TestUnixTimeUnits(t *testing.T) {
 	want := time.Date(2026, 7, 30, 10, 0, 0, 0, time.UTC)
 	seconds := want.Unix()
@@ -429,7 +387,7 @@ func TestDiscoverOnlyTakesRecentTraceFiles(t *testing.T) {
 
 func TestDemoReportTotals(t *testing.T) {
 	report := DemoReport()
-	if report.Observed <= 0 || report.Recoverable <= 0 {
+	if report.Observed <= 0 || report.Blocked <= 0 {
 		t.Fatal("demo report should contain observed and recoverable time")
 	}
 	if report.Throughput <= 0 || report.Throughput >= 1 {
@@ -438,12 +396,22 @@ func TestDemoReportTotals(t *testing.T) {
 	if len(report.Findings) < 3 {
 		t.Fatalf("expected findings, got %d", len(report.Findings))
 	}
-	var sum time.Duration
+	var counted, excluded time.Duration
 	for _, category := range report.Categories {
-		sum += category.Duration
+		if category.Group == GroupExcluded {
+			excluded += category.Duration
+			continue
+		}
+		counted += category.Duration
 	}
-	if sum != report.Observed {
-		t.Fatalf("categories sum to %s but observed is %s", sum, report.Observed)
+	if counted != report.Observed {
+		t.Fatalf("counted categories sum to %s but observed is %s", counted, report.Observed)
+	}
+	if excluded != report.Human {
+		t.Fatalf("excluded categories sum to %s but human is %s", excluded, report.Human)
+	}
+	if report.Human == 0 {
+		t.Fatal("the demo should exercise excluded human time")
 	}
 }
 

@@ -14,15 +14,13 @@
     --faint: #353833;
     --panel: #171916;
     --bg: #0D0F0C;
-    --orange: #FF6B35;
-    --lime: #C8F56A;
-    --blue: #61A8FF;
-    --purple: #B197FC;
-    --yellow: #FFD166;
-    --red: #FF5D73;
-    --teal: #57D7C4;
-    --dependency: #C084FC;
-    --retry: #FB7185;
+    --brand: #FF6B35;
+    /* Two data hues, validated against the panel surface: worst-pair CVD
+       deltaE 10.4, normal-vision 20.7, contrast >= 3:1. Repeated work shares the
+       warm hue and is separated by texture, not by a third hue. */
+    --working: #05A388;
+    --blocked: #C17938;
+    --outside: #6B6E68;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
@@ -67,8 +65,8 @@
 
   p { margin: 0 0 1rem; }
 
-  a { color: var(--blue); }
-  a:hover { color: var(--teal); }
+  a { color: var(--working); }
+  a:hover { color: var(--brand); }
 
   code, pre, .mono { font-family: var(--mono); }
 
@@ -84,7 +82,7 @@
     font-weight: 700;
   }
 
-  .wordmark .wasted { color: var(--orange); }
+  .wordmark .wasted { color: var(--brand); }
   .wordmark .cycles { color: var(--ink); }
 
   .tagline {
@@ -124,7 +122,7 @@
     color: var(--ink);
   }
 
-  pre .prompt { color: var(--lime); user-select: none; }
+  pre .prompt { color: var(--working); user-select: none; }
 
   .copy {
     position: absolute;
@@ -162,7 +160,7 @@
     content: "?";
     position: absolute;
     left: 0;
-    color: var(--purple);
+    color: var(--working);
     font-family: var(--mono);
     font-weight: 700;
   }
@@ -197,14 +195,29 @@
     font-size: 0.75rem;
     letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: var(--yellow);
-    border: 1px solid var(--yellow);
+    color: var(--blocked);
+    border: 1px solid var(--blocked);
     border-radius: 4px;
     padding: 0.15rem 0.45rem;
     margin-bottom: 0.75rem;
   }
 
   .hist { font-family: var(--mono); font-size: 0.8125rem; }
+
+  .grp {
+    font-size: 0.6875rem;
+    letter-spacing: 0.14em;
+    color: var(--muted);
+    font-weight: 700;
+    margin: 0.9rem 0 0.35rem;
+  }
+  .hist .grp:first-child { margin-top: 0; }
+
+  .fill.textured {
+    background-image: repeating-linear-gradient(
+      45deg, transparent 0 3px, rgba(0, 0, 0, 0.45) 3px 6px
+    );
+  }
 
   .row {
     display: grid;
@@ -273,12 +286,12 @@
     font-weight: 600;
   }
 
-  td.src { font-family: var(--mono); font-size: 0.8125rem; color: var(--teal); white-space: nowrap; }
+  td.src { font-family: var(--mono); font-size: 0.8125rem; color: var(--working); white-space: nowrap; }
 
   /* ---------- method ---------- */
 
   .method p { max-width: 46rem; }
-  .method .privacy { color: var(--lime); }
+  .method .privacy { color: var(--working); }
 
   .flags { display: grid; gap: 0.65rem; }
 
@@ -292,7 +305,7 @@
   }
 
   .flag:last-child { border-bottom: 0; }
-  .flag code { color: var(--lime); font-size: 0.875rem; }
+  .flag code { color: var(--working); font-size: 0.875rem; }
   .flag span { color: var(--muted); }
 
   /* ---------- footer ---------- */
@@ -343,11 +356,13 @@
   <header>
     <p class="kicker">Local wall-clock profiler</p>
     <h1 class="wordmark"><span class="wasted">WASTED</span> <span class="cycles">CYCLES</span></h1>
-    <p class="tagline">Find where coding-agent runs stop coding.</p>
+    <p class="tagline">Find the machines your coding agent is waiting on.</p>
     <p class="lede">
-      Wasted Cycles reads the Codex, Claude Code, Cursor Agent, and Grok Build traces already
-      on your machine and turns them into an interactive terminal histogram: model work, reads,
-      edits, verify runs, CI waits, human handoffs, agent joins, network stalls, and retries.
+      A wasted cycle is time your agent spends blocked on compute it does not control —
+      compiling, running tests, waiting on CI, provisioning containers, fetching packages,
+      joining sub-agents. Wasted Cycles reads the traces already on your machine and shows how
+      much of a run was that, and which machine to fix first. Time spent waiting on a
+      <em>person</em> is not a wasted cycle: it is reported separately and never enters the metric.
     </p>
   </header>
 
@@ -365,10 +380,10 @@
   <section>
     <h2>What it answers</h2>
     <ul class="answers">
-      <li>What share of elapsed time was actual model reasoning?</li>
-      <li>Which waits dominate the critical path?</li>
-      <li>Are retries, CI, humans, or sub-agents limiting throughput?</li>
-      <li>Which coding harness stays productive for your workload?</li>
+      <li>How much of a run was spent blocked on a machine instead of coding?</li>
+      <li>Which one — the compiler, the test suite, CI, containers, or the registry?</li>
+      <li>Is the same build or test running more than once?</li>
+      <li>Which coding harness keeps moving on your workload?</li>
       <li>What is the highest-impact bottleneck to fix next?</li>
     </ul>
   </section>
@@ -390,65 +405,78 @@
       </div>
 
       <div class="hist">
-        <div class="row" style="--c: var(--purple)">
+        <p class="grp">AGENT WORKING</p>
+        <div class="row" style="--c: var(--working)">
           <span class="label">Model work</span>
-          <span class="track"><span class="fill" style="width: 91.4%"></span></span>
-          <span class="value">1h 04m <span class="pct">23%</span></span>
+          <span class="track"><span class=" fill" style="width: 91.4%"></span></span>
+          <span class="value">1h 04m <span class="pct">21%</span></span>
         </div>
-        <div class="row" style="--c: var(--blue)">
+        <div class="row" style="--c: var(--working)">
           <span class="label">Read &amp; search</span>
-          <span class="track"><span class="fill" style="width: 48.6%"></span></span>
-          <span class="value">34m <span class="pct">12%</span></span>
+          <span class="track"><span class=" fill" style="width: 48.6%"></span></span>
+          <span class="value">34m <span class="pct">11%</span></span>
         </div>
-        <div class="row" style="--c: var(--lime)">
+        <div class="row" style="--c: var(--working)">
           <span class="label">Code changes</span>
-          <span class="track"><span class="fill" style="width: 100%"></span></span>
-          <span class="value">1h 10m <span class="pct">25%</span></span>
+          <span class="track"><span class=" fill" style="width: 100.0%"></span></span>
+          <span class="value">1h 10m <span class="pct">23%</span></span>
         </div>
-        <div class="row" style="--c: var(--teal)">
-          <span class="label">Local verify</span>
-          <span class="track"><span class="fill" style="width: 57.1%"></span></span>
-          <span class="value">40m <span class="pct">14%</span></span>
-        </div>
-        <div class="row" style="--c: var(--muted)">
+        <div class="row" style="--c: var(--working)">
           <span class="label">Other tool work</span>
-          <span class="track"><span class="fill" style="width: 8.6%"></span></span>
+          <span class="track"><span class=" fill" style="width: 8.6%"></span></span>
           <span class="value">6m <span class="pct">2%</span></span>
         </div>
-        <div class="row" style="--c: var(--orange)">
-          <span class="label">Waiting for CI</span>
-          <span class="track"><span class="fill" style="width: 34.3%"></span></span>
-          <span class="value">24m <span class="pct">9%</span></span>
+        <p class="grp">BLOCKED ON COMPUTE</p>
+        <div class="row" style="--c: var(--blocked)">
+          <span class="label">Waiting for build</span>
+          <span class="track"><span class=" fill" style="width: 45.7%"></span></span>
+          <span class="value">32m <span class="pct">11%</span></span>
         </div>
-        <div class="row" style="--c: var(--yellow)">
+        <div class="row" style="--c: var(--blocked)">
+          <span class="label">Waiting for tests</span>
+          <span class="track"><span class=" fill" style="width: 41.4%"></span></span>
+          <span class="value">29m <span class="pct">10%</span></span>
+        </div>
+        <div class="row" style="--c: var(--blocked)">
+          <span class="label">Waiting for CI</span>
+          <span class="track"><span class=" fill" style="width: 34.3%"></span></span>
+          <span class="value">24m <span class="pct">8%</span></span>
+        </div>
+        <div class="row" style="--c: var(--blocked)">
+          <span class="label">Waiting for containers</span>
+          <span class="track"><span class=" fill" style="width: 18.6%"></span></span>
+          <span class="value">13m <span class="pct">4%</span></span>
+        </div>
+        <div class="row" style="--c: var(--blocked)">
           <span class="label">Waiting for agents</span>
-          <span class="track"><span class="fill" style="width: 17.1%"></span></span>
+          <span class="track"><span class=" fill" style="width: 17.1%"></span></span>
           <span class="value">12m <span class="pct">4%</span></span>
         </div>
-        <div class="row" style="--c: var(--red)">
-          <span class="label">Waiting for human</span>
-          <span class="track"><span class="fill" style="width: 24.3%"></span></span>
-          <span class="value">17m <span class="pct">6%</span></span>
-        </div>
-        <div class="row" style="--c: var(--dependency)">
-          <span class="label">Tool / network wait</span>
-          <span class="track"><span class="fill" style="width: 10%"></span></span>
+        <div class="row" style="--c: var(--blocked)">
+          <span class="label">Waiting for packages</span>
+          <span class="track"><span class=" fill" style="width: 10.0%"></span></span>
           <span class="value">7m <span class="pct">2%</span></span>
         </div>
-        <div class="row" style="--c: var(--retry)">
-          <span class="label">Retries</span>
-          <span class="track"><span class="fill" style="width: 11.4%"></span></span>
+        <div class="row" style="--c: var(--blocked)">
+          <span class="label">Repeated build / test</span>
+          <span class="track"><span class=" fill textured" style="width: 11.4%"></span></span>
           <span class="value">8m <span class="pct">3%</span></span>
+        </div>
+        <p class="grp">NOT COUNTED</p>
+        <div class="row" style="--c: var(--outside)">
+          <span class="label">Outside the agent loop</span>
+          <span class="track"><span class=" fill" style="width: 68.6%"></span></span>
+          <span class="value">48m</span>
         </div>
       </div>
 
       <div class="total">
-        <span>Observed elapsed time</span>
-        <span><b>4h 42m</b></span>
+        <span>Agent time · blocked on compute</span>
+        <span><b>4h 59m</b> · <b>2h 05m</b> (42%)</span>
       </div>
 
       <p class="hist-foot">
-        Time between timestamped trace events · idle gaps capped at 30m
+        Blocked on compute is what this tool measures · human time is shown but never counted
       </p>
     </div>
 
@@ -468,7 +496,6 @@
         <tbody>
           <tr><td>Codex</td><td class="src">~/.codex/sessions</td><td>per event</td></tr>
           <tr><td>Claude Code</td><td class="src">~/.claude/projects</td><td>per event</td></tr>
-          <tr><td>Cursor Agent</td><td class="src">~/.cursor/projects</td><td>per turn</td></tr>
           <tr><td>Grok Build</td><td class="src">~/.grok/sessions</td><td>per turn</td></tr>
         </tbody>
       </table>
@@ -476,6 +503,14 @@
     <p class="note" style="margin-top: 0.85rem;">
       JSONL trace files modified inside the selected window are read in place. Nothing is
       written back, and nothing leaves the machine.
+    </p>
+    <p class="note" style="margin-top: 0.6rem;">
+      <strong>Cursor is not supported.</strong> Its transcripts carry no per-event timestamps,
+      only a wall-clock marker on each user turn, and time reconstructed from those markers
+      cannot separate work from idling — on a real corpus it reported a scheduled agent that
+      ticked every 30 minutes for five days as 120 hours of continuous work. A number that
+      wrong is worse than no number, so Cursor traces are skipped until the harness records
+      event times.
     </p>
   </section>
 
@@ -490,8 +525,16 @@
       and not cost.
     </p>
     <p>
-      A verification or CI command that repeats is reclassified as retry time, so a test
-      loop shows up as a loop rather than as more verification.
+      Every segment lands in one of three groups: <strong>agent working</strong> (model work,
+      reads, edits, other tool calls), <strong>blocked on compute</strong> (build, tests, CI,
+      containers, packages, sub-agents, repeated work), and <strong>not counted</strong>
+      (waiting on a human). Agent time is working plus blocked; throughput is the share of
+      agent time that was not spent waiting on a machine. Human time sits beside those numbers
+      so you can see it, and outside them so it cannot distort them.
+    </p>
+    <p>
+      A build, test, or CI command that runs more than once in a session is reclassified as
+      repeated work, because the machine did the same job twice.
     </p>
     <p>
       Harnesses record different things. Codex and Claude Code stamp individual events.

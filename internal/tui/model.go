@@ -15,25 +15,25 @@ import (
 
 const (
 	tabOverview = iota
-	tabTimeline
-	tabSessions
+	tabHistogram
+	tabRuns
 	tabMethod
 )
 
+// Two data hues, not twelve: cool means the agent was working, warm means it was
+// blocked on a machine. Both were picked by the palette validator against the
+// panel surface — worst-pair CVD ΔE 10.4, normal-vision 20.7, contrast >= 3:1.
+// Repeated work shares the warm hue and is separated by texture instead of a
+// third hue, because no warm/red pair survives deuteranopia at this lightness.
 var (
-	ink       = lipgloss.Color("#F3F2ED")
-	muted     = lipgloss.Color("#858780")
-	faint     = lipgloss.Color("#353833")
-	panel     = lipgloss.Color("#171916")
-	orange    = lipgloss.Color("#FF6B35")
-	lime      = lipgloss.Color("#C8F56A")
-	blue      = lipgloss.Color("#61A8FF")
-	purple    = lipgloss.Color("#B197FC")
-	yellow    = lipgloss.Color("#FFD166")
-	red       = lipgloss.Color("#FF5D73")
-	teal      = lipgloss.Color("#57D7C4")
-	slate     = lipgloss.Color("#7C8B96")
-	baseStyle = lipgloss.NewStyle().Foreground(ink)
+	ink     = lipgloss.Color("#F3F2ED")
+	muted   = lipgloss.Color("#858780")
+	faint   = lipgloss.Color("#353833")
+	panel   = lipgloss.Color("#171916")
+	brand   = lipgloss.Color("#FF6B35")
+	working = lipgloss.Color("#05A388")
+	blocked = lipgloss.Color("#C17938")
+	outside = lipgloss.Color("#6B6E68")
 )
 
 type Model struct {
@@ -45,7 +45,7 @@ type Model struct {
 }
 
 func New(report analyze.Report, version string) Model {
-	return Model{report: report, version: version, width: 104, height: 32}
+	return Model{report: report, version: version, width: 100, height: 30}
 }
 
 func (m Model) Init() tea.Cmd { return nil }
@@ -53,8 +53,7 @@ func (m Model) Init() tea.Cmd { return nil }
 func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		m.width, m.height = msg.Width, msg.Height
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
@@ -66,9 +65,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "1":
 			m.tab = tabOverview
 		case "2":
-			m.tab = tabTimeline
+			m.tab = tabHistogram
 		case "3":
-			m.tab = tabSessions
+			m.tab = tabRuns
 		case "4":
 			m.tab = tabMethod
 		}
@@ -77,209 +76,288 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
-	width := m.width
-	if width < 68 {
-		width = 68
-	}
-	bodyWidth := min(width-4, 116)
-	var body string
-	switch m.tab {
-	case tabTimeline:
-		body = m.timeline(bodyWidth)
-	case tabSessions:
-		body = m.sessions(bodyWidth)
-	case tabMethod:
-		body = m.method(bodyWidth)
-	default:
-		body = m.overview(bodyWidth)
-	}
+	width := max(m.width, 60)
+	body := min(width-4, 110)
 
-	header := m.header(bodyWidth)
-	left, right := "←/→ switch view   1–4 jump   q quit", "local only · no uploads"
-	gap := bodyWidth - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		left, right = "←/→ · 1–4 · q", "local only"
-		gap = bodyWidth - lipgloss.Width(left) - lipgloss.Width(right)
+	var content string
+	switch m.tab {
+	case tabHistogram:
+		content = m.histogram(body)
+	case tabRuns:
+		content = m.runs(body)
+	case tabMethod:
+		content = m.method(body)
+	default:
+		content = m.overview(body)
 	}
-	footer := lipgloss.NewStyle().Foreground(muted).Render(
-		truncate(left+strings.Repeat(" ", max(1, gap))+right, bodyWidth),
-	)
-	page := lipgloss.JoinVertical(lipgloss.Left, header, "", body, "", footer)
+	page := lipgloss.JoinVertical(lipgloss.Left, m.header(body), content, m.footer(body))
 	return lipgloss.NewStyle().MarginLeft(2).MarginTop(1).Render(page)
 }
 
 func (m Model) header(width int) string {
-	wordmark := lipgloss.NewStyle().Bold(true).Foreground(orange).Render("WASTED")
-	wordmark += lipgloss.NewStyle().Bold(true).Foreground(ink).Render(" CYCLES")
+	mark := lipgloss.NewStyle().Bold(true).Foreground(brand).Render("WASTED") +
+		lipgloss.NewStyle().Bold(true).Foreground(ink).Render(" CYCLES")
 	scope := fmt.Sprintf("last %s · %d traces", relativePeriod(m.report.Since), m.report.Scanned)
 	if m.report.IsDemo {
-		scope = "demo dataset · Codex + Claude + Cursor + Grok"
+		scope = "demo dataset"
 	}
-	top := lipgloss.JoinHorizontal(lipgloss.Top,
-		wordmark,
-		strings.Repeat(" ", max(1, width-lipgloss.Width(wordmark)-lipgloss.Width(scope))),
-		lipgloss.NewStyle().Foreground(muted).Render(scope),
-	)
+	top := spread(mark, lipgloss.NewStyle().Foreground(muted).Render(scope), width)
 
-	labels := []string{"1  OVERVIEW", "2  HISTOGRAM", "3  RUNS", "4  METHOD"}
 	var tabs []string
-	for index, label := range labels {
+	for index, label := range []string{"1 OVERVIEW", "2 HISTOGRAM", "3 RUNS", "4 METHOD"} {
 		style := lipgloss.NewStyle().Padding(0, 1).Foreground(muted)
 		if index == m.tab {
 			style = style.Foreground(ink).Bold(true).Background(faint)
 		}
 		tabs = append(tabs, style.Render(label))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, top, "", lipgloss.JoinHorizontal(lipgloss.Left, tabs...))
+	return lipgloss.JoinVertical(lipgloss.Left, top, "", truncate(strings.Join(tabs, ""), width))
+}
+
+func (m Model) footer(width int) string {
+	left, right := "←/→ view   1–4 jump   q quit", "local only · no uploads"
+	if lipgloss.Width(left)+lipgloss.Width(right)+1 > width {
+		left, right = "←/→ · q quit", "local only"
+	}
+	return lipgloss.NewStyle().Foreground(muted).Render(spread(left, right, width))
 }
 
 func (m Model) overview(width int) string {
 	if len(m.report.Sessions) == 0 {
 		return m.empty(width)
 	}
+	report := m.report
+
 	perRow := 4
-	if width < 76 {
+	if width < 72 {
 		perRow = 2
 	}
-	cardWidth := max(18, (width-perRow+1)/perRow)
+	cardWidth := max(17, (width-perRow+1)/perRow)
 	cards := []string{
-		statCard(cardWidth, "OBSERVED", duration(m.report.Observed), "wall-clock in traces", ink),
-		statCard(cardWidth, "REASONING SHARE", percent(categoryDuration(m.report, "reasoning"), m.report.Observed), "model inference proxy", purple),
-		statCard(cardWidth, "RECOVERABLE", duration(m.report.Recoverable), "blocked + repeated", red),
-		statCard(cardWidth, "THROUGHPUT", fmt.Sprintf("%.0f%%", m.report.Throughput*100), throughputLabel(m.report.Throughput), lime),
+		card(cardWidth, "AGENT TIME", duration(report.Observed), "excl. human", ink),
+		card(cardWidth, "BLOCKED", duration(report.Blocked), share(report.Blocked, report.Observed)+" of agent", blocked),
+		card(cardWidth, "THROUGHPUT", fmt.Sprintf("%.0f%%", report.Throughput*100), verdict(report.Throughput), working),
+		card(cardWidth, "HUMAN TIME", duration(report.Human), "not counted", outside),
 	}
 	var rows []string
 	for start := 0; start < len(cards); start += perRow {
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, cards[start:min(start+perRow, len(cards))]...))
 	}
-	cardsRow := lipgloss.JoinVertical(lipgloss.Left, rows...)
 
-	leftWidth := max(38, int(float64(width)*0.58))
-	rightWidth := width - leftWidth - 2
-	histogram := panelStyle(leftWidth).Render(m.histogram(leftWidth - 4))
-	findings := panelStyle(rightWidth).Render(m.topFindings(rightWidth - 4))
-	lower := lipgloss.JoinHorizontal(lipgloss.Top, histogram, "  ", findings)
-	return lipgloss.JoinVertical(lipgloss.Left, cardsRow, "", lower)
+	left := max(34, int(float64(width)*.5))
+	right := width - left - 2
+	lower := lipgloss.JoinHorizontal(lipgloss.Top,
+		box(left).Render(m.summary(left-4)),
+		"  ",
+		box(right).Render(m.leaks(right-4)),
+	)
+	return lipgloss.JoinVertical(lipgloss.Left, lipgloss.JoinVertical(lipgloss.Left, rows...), "", lower)
 }
 
 func (m Model) histogram(width int) string {
-	title := sectionTitle("WHERE THE TIME WENT", fmt.Sprintf("%d classified buckets", len(m.report.Categories)))
-	maxDuration := time.Duration(0)
+	if len(m.report.Sessions) == 0 {
+		return m.empty(width)
+	}
+	return box(width).Render(m.bars(width - 4))
+}
+
+// The Overview answers one question — how much of the run was blocked — so it
+// shows the three group totals. Per-category detail is one keystroke away on the
+// Histogram tab.
+func (m Model) summary(width int) string {
+	totals := map[string]time.Duration{}
 	for _, category := range m.report.Categories {
-		if category.Duration > maxDuration {
-			maxDuration = category.Duration
+		totals[category.Group] += category.Duration
+	}
+	peak := time.Duration(0)
+	for _, value := range totals {
+		if value > peak {
+			peak = value
 		}
 	}
-	labelWidth := min(18, max(13, width/3))
-	barWidth := max(8, width-labelWidth-13)
-	lines := []string{title, ""}
-	for _, category := range m.report.Categories {
-		ratio := 0.0
-		if maxDuration > 0 {
-			ratio = float64(category.Duration) / float64(maxDuration)
+
+	labelWidth := min(20, max(12, width/3))
+	barWidth := max(6, width-labelWidth-15)
+	lines := []string{heading("WHERE THE TIME WENT", "by group"), ""}
+	for _, group := range []struct {
+		id, label string
+		glyph     string
+		colour    lipgloss.Color
+	}{
+		{analyze.GroupWorking, "Coding", "█", working},
+		{analyze.GroupBlocked, "Blocked", "█", blocked},
+		{analyze.GroupExcluded, "Not counted", "░", outside},
+	} {
+		value := totals[group.id]
+		if value == 0 {
+			continue
 		}
-		fill := int(math.Round(ratio * float64(barWidth)))
-		color := categoryColor(category.ID)
-		bar := lipgloss.NewStyle().Foreground(color).Render(strings.Repeat("█", fill))
-		bar += lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("░", max(0, barWidth-fill)))
-		label := lipgloss.NewStyle().Width(labelWidth).Foreground(ink).Render(category.Label)
-		value := lipgloss.NewStyle().Width(9).Align(lipgloss.Right).Foreground(color).Bold(true).Render(duration(category.Duration))
-		lines = append(lines, label+" "+bar+" "+value)
+		fill := 0
+		if peak > 0 {
+			fill = max(1, int(math.Round(float64(value)/float64(peak)*float64(barWidth))))
+		}
+		bar := lipgloss.NewStyle().Foreground(group.colour).Render(strings.Repeat(group.glyph, fill)) +
+			lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("·", max(0, barWidth-fill)))
+		lines = append(lines,
+			lipgloss.NewStyle().Width(labelWidth).Foreground(ink).Render(truncate(group.label, labelWidth))+
+				bar+
+				lipgloss.NewStyle().Width(8).Align(lipgloss.Right).Foreground(ink).Render(duration(value)))
 	}
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(
-		"Time between timestamped trace events · breaks over 2h dropped, shorter gaps capped at 30m",
-	))
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) topFindings(width int) string {
-	title := sectionTitle("BIGGEST LEAKS", "ranked by elapsed time")
+// One row per category, grouped: the eye should land on the warm block and know
+// immediately how much of the run was spent waiting on a machine.
+func (m Model) bars(width int) string {
+	title := heading("WHERE THE TIME WENT", fmt.Sprintf("%s of %s blocked",
+		duration(m.report.Blocked), duration(m.report.Observed)))
+
+	peak := time.Duration(0)
+	for _, category := range m.report.Categories {
+		if category.Duration > peak {
+			peak = category.Duration
+		}
+	}
+	labelWidth := min(22, max(14, width/3))
+	barWidth := max(6, width-labelWidth-16)
+
 	lines := []string{title, ""}
+	groups := []struct{ id, title string }{
+		{analyze.GroupWorking, "AGENT WORKING"},
+		{analyze.GroupBlocked, "BLOCKED ON COMPUTE"},
+		{analyze.GroupExcluded, "NOT COUNTED"},
+	}
+	for _, group := range groups {
+		rows := 0
+		for _, category := range m.report.Categories {
+			if category.Group != group.id || category.Duration == 0 {
+				continue
+			}
+			if rows == 0 {
+				if len(lines) > 2 {
+					lines = append(lines, "")
+				}
+				lines = append(lines, lipgloss.NewStyle().Foreground(muted).Bold(true).Render(group.title))
+			}
+			rows++
+			lines = append(lines, barRow(category, peak, labelWidth, barWidth))
+		}
+	}
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(truncate(legend(), width)))
+	return strings.Join(lines, "\n")
+}
+
+func barRow(category analyze.Category, peak time.Duration, labelWidth, barWidth int) string {
+	ratio := 0.0
+	if peak > 0 {
+		ratio = float64(category.Duration) / float64(peak)
+	}
+	fill := int(math.Round(ratio * float64(barWidth)))
+	if fill == 0 && category.Duration > 0 {
+		fill = 1
+	}
+
+	glyph, colour := "█", working
+	switch category.Group {
+	case analyze.GroupBlocked:
+		colour = blocked
+		if category.ID == "retry" {
+			glyph = "▒"
+		}
+	case analyze.GroupExcluded:
+		glyph, colour = "░", outside
+	}
+
+	bar := lipgloss.NewStyle().Foreground(colour).Render(strings.Repeat(glyph, max(0, fill))) +
+		lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("·", max(0, barWidth-fill)))
+
+	// Values stay in text ink; the bar beside them carries the identity.
+	value := lipgloss.NewStyle().Width(8).Align(lipgloss.Right).Foreground(ink).Render(duration(category.Duration))
+	row := lipgloss.NewStyle().Width(labelWidth).Foreground(ink).Render(truncate("  "+category.Label, labelWidth)) + bar + value
+	if category.Group != analyze.GroupExcluded {
+		row += lipgloss.NewStyle().Width(5).Align(lipgloss.Right).Foreground(muted).Render(fmt.Sprintf("%.0f%%", category.Share*100))
+	}
+	return row
+}
+
+func legend() string {
+	return lipgloss.NewStyle().Foreground(working).Render("█") +
+		lipgloss.NewStyle().Foreground(muted).Render(" coding   ") +
+		lipgloss.NewStyle().Foreground(blocked).Render("█") +
+		lipgloss.NewStyle().Foreground(muted).Render(" blocked on compute   ") +
+		lipgloss.NewStyle().Foreground(blocked).Render("▒") +
+		lipgloss.NewStyle().Foreground(muted).Render(" repeated   ") +
+		lipgloss.NewStyle().Foreground(outside).Render("░") +
+		lipgloss.NewStyle().Foreground(muted).Render(" not counted")
+}
+
+func (m Model) leaks(width int) string {
+	lines := []string{heading("BIGGEST STALLS", "ranked by machine time"), ""}
 	if len(m.report.Findings) == 0 {
-		lines = append(lines,
-			lipgloss.NewStyle().Foreground(lime).Bold(true).Render("No material wait pattern"),
-			lipgloss.NewStyle().Foreground(muted).Render("This window looks healthy."),
-		)
-		return strings.Join(lines, "\n")
+		return strings.Join(append(lines,
+			lipgloss.NewStyle().Foreground(working).Bold(true).Render("Nothing is blocking runs"),
+			lipgloss.NewStyle().Foreground(muted).Render(wrap("No build, test, CI, container, or package wait is material in this window.", width)),
+		), "\n")
 	}
 	for index, finding := range m.report.Findings {
 		if index >= 3 {
 			break
 		}
-		number := lipgloss.NewStyle().Foreground(categoryColor(finding.Category)).Bold(true).Render(fmt.Sprintf("%d", index+1))
-		saving := lipgloss.NewStyle().Foreground(red).Bold(true).Render(duration(finding.Recoverable))
-		lines = append(lines, number+"  "+lipgloss.NewStyle().Bold(true).Render(finding.Title))
-		lines = append(lines, "   "+saving+" "+lipgloss.NewStyle().Foreground(muted).Render("on the critical path"))
-		if index < min(2, len(m.report.Findings)-1) {
+		if index > 0 {
 			lines = append(lines, "")
 		}
+		lines = append(lines,
+			lipgloss.NewStyle().Foreground(blocked).Bold(true).Render(fmt.Sprintf("%d ", index+1))+
+				lipgloss.NewStyle().Bold(true).Foreground(ink).Render(truncate(finding.Title, width-2)),
+			lipgloss.NewStyle().Foreground(muted).Render(wrap(duration(finding.Recoverable)+" on the critical path", width)),
+		)
 	}
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) timeline(width int) string {
-	title := sectionTitle("WALL-CLOCK HISTOGRAM", "each block ≈ one slice of observed time")
-	lines := []string{title, ""}
+func (m Model) runs(width int) string {
 	if len(m.report.Sessions) == 0 {
 		return m.empty(width)
 	}
-	labelWidth := min(24, max(16, width/4))
-	barWidth := max(24, width-labelWidth-16)
-	for _, session := range m.report.Sessions {
-		if len(lines) > max(11, m.height-9) {
-			break
-		}
-		label := fmt.Sprintf("%s / %s", session.Provider, session.Project)
-		label = truncate(label, labelWidth-1)
-		bar := segmentBar(session.Segments, session.Duration, barWidth)
-		value := lipgloss.NewStyle().Width(9).Align(lipgloss.Right).Foreground(muted).Render(duration(session.Duration))
-		lines = append(lines, lipgloss.NewStyle().Width(labelWidth).Foreground(ink).Render(label)+bar+value)
-	}
-	lines = append(lines, "", legend(width-4))
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(
-		"Long offline gaps are excluded. Repeated test/CI commands are reclassified as retries.",
-	))
-	return panelStyle(width).Render(strings.Join(lines, "\n"))
-}
-
-func (m Model) sessions(width int) string {
-	title := sectionTitle("RUN COMPARISON", "which harness keeps moving?")
-	lines := []string{title, ""}
-	if len(m.report.Sessions) == 0 {
-		return m.empty(width)
-	}
-	// Columns are dropped rather than wrapped as the terminal narrows: a wrapped
-	// row is unreadable, a shorter row is not.
 	inner := width - 4
-	showDetail, showEnded := inner >= 78, inner >= 66
-	project := max(8, min(22, inner-44))
-	layout := "%-10s %-" + fmt.Sprint(project) + "s %10s %11.0f%%"
-	heads := []any{"HARNESS", "PROJECT", "OBSERVED", "THROUGHPUT"}
-	headLayout := "%-10s %-" + fmt.Sprint(project) + "s %10s %12s"
+	showEnded := inner >= 68
+	showDetail := inner >= 80
+	project := max(8, min(22, inner-46))
+
+	layout := "%-9s %-" + fmt.Sprint(project) + "s %9s %9s %7s"
+	heads := []any{"HARNESS", "PROJECT", "AGENT", "BLOCKED", "THRUPUT"}
 	if showEnded {
-		layout, headLayout = layout+" %11s", headLayout+" %11s"
+		layout += " %11s"
 		heads = append(heads, "ENDED")
 	}
 	if showDetail {
-		layout, headLayout = layout+" %6s", headLayout+" %6s"
+		layout += " %6s"
 		heads = append(heads, "DETAIL")
 	}
 
-	lines = append(lines,
-		lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf(headLayout, heads...)),
-		lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("─", max(1, min(inner, 82)))),
-	)
+	lines := []string{
+		heading("RUN COMPARISON", "which harness keeps moving?"), "",
+		lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf(layout, heads...)),
+		lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("─", max(1, min(inner, 88)))),
+	}
+
 	coarse := false
-	for _, session := range m.report.Sessions {
+	limit := max(4, m.height-16)
+	for index, session := range m.report.Sessions {
+		if index >= limit {
+			lines = append(lines, lipgloss.NewStyle().Foreground(muted).
+				Render(fmt.Sprintf("  … %d more runs (--json for all)", len(m.report.Sessions)-index)))
+			break
+		}
 		detail := "event"
 		if session.Resolution == "turn" {
 			detail, coarse = "turn", true
 		}
+		stalled := session.Duration - time.Duration(session.Throughput*float64(session.Duration))
 		values := []any{
-			truncate(session.Provider, 10),
-			truncate(session.Project, project),
-			duration(session.Duration),
-			session.Throughput * 100,
+			truncate(session.Provider, 9), truncate(session.Project, project),
+			duration(session.Duration), duration(stalled),
+			fmt.Sprintf("%.0f%%", session.Throughput*100),
 		}
 		if showEnded {
 			values = append(values, session.End.Format("Jan 02 15:04"))
@@ -287,225 +365,151 @@ func (m Model) sessions(width int) string {
 		if showDetail {
 			values = append(values, detail)
 		}
-		row := fmt.Sprintf(layout, values...)
-		color := lime
-		if session.Throughput < .7 {
-			color = yellow
+		colour := ink
+		if session.Throughput < .9 {
+			colour = blocked
 		}
-		if session.Throughput < .5 {
-			color = red
-		}
-		lines = append(lines, lipgloss.NewStyle().Foreground(color).Render(row))
+		lines = append(lines, lipgloss.NewStyle().Foreground(colour).Render(fmt.Sprintf(layout, values...)))
 	}
-	note := "Throughput = observed time minus CI, human, agent, dependency, and retry waits."
+
+	note := "Throughput = agent time that was not spent waiting on a machine. Human time is excluded."
 	if coarse && showDetail {
-		note += "\nturn = the harness records no per-event timestamps, so segments span a whole turn."
+		note += "\nturn = the harness stamps no per-event times, so a segment spans a whole turn."
 	}
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(note))
-	return panelStyle(width).Render(strings.Join(lines, "\n"))
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(wrap(note, inner)))
+	return box(width).Render(strings.Join(lines, "\n"))
 }
 
 func (m Model) method(width int) string {
-	sourceText := "No supported trace files found."
+	inner := width - 4
+	sources := "none found"
 	if len(m.report.Sources) > 0 {
-		var sources []string
+		var parts []string
 		for _, source := range m.report.Sources {
-			sources = append(sources, fmt.Sprintf("%s (%d)", source.Provider, source.Files))
+			parts = append(parts, fmt.Sprintf("%s (%d)", source.Provider, source.Files))
 		}
-		sourceText = strings.Join(sources, " · ")
+		sources = strings.Join(parts, " · ")
 	}
-	copy := []string{
-		sectionTitle("METHOD & TRUST", "use the number, know its limits"),
-		"",
-		lipgloss.NewStyle().Bold(true).Foreground(ink).Render("What is measured"),
-		wrap("Wasted Cycles reads local JSONL traces and reconstructs elapsed wall-clock segments between timestamped events. Each segment is classified by the structured action that opened it: the tool that was called, the command it ran, or the message that ended a turn. Records it cannot identify are skipped rather than guessed, so their elapsed time stays attributed to the last recognized action.", width-4),
-		"",
-		lipgloss.NewStyle().Bold(true).Foreground(purple).Render("Inference is a proxy"),
-		wrap("Harnesses expose different timing detail. “Model work” means the interval after a user message or tool result and before the next emitted action. It is not GPU compute time unless the trace explicitly records duration.", width-4),
-		"",
-		lipgloss.NewStyle().Bold(true).Foreground(yellow).Render("Resolution differs by harness"),
-		wrap("Codex, Claude Code, and Grok Build stamp individual events. Cursor does not, so its transcripts are reconstructed per user turn and each turn takes the dominant tool category it observed. Those runs are marked “turn” on the Runs screen and carry low confidence in JSON output.", width-4),
-		"",
-		lipgloss.NewStyle().Bold(true).Foreground(red).Render("Guardrails"),
-		wrap("A gap longer than 2 hours is treated as a session break and is not counted at all, so an overnight pause cannot become “waiting for human”. Shorter gaps are capped at 30 minutes; those segments are marked clamped with low confidence. "+inferredNote(m.report)+" Prompt text and source code are never retained, rendered, or uploaded.", width-4),
-		"",
-		lipgloss.NewStyle().Foreground(muted).Render("Detected  " + sourceText),
+
+	labelWidth := min(18, max(12, inner/4))
+	rows := []struct {
+		label, body string
+		colour      lipgloss.Color
+	}{
+		{"A wasted cycle", "Time blocked on a machine you do not control: builds, tests, CI, containers, packages, sub-agents. A repeat counts twice — the machine did the work twice.", blocked},
+		{"Not counted", "Waiting on a person. Reported beside the metric, never inside it.", outside},
+		{"Gaps", "Over 2h is a session break and is dropped. Shorter gaps are capped at 30m and marked clamped. " + inferredNote(m.report), ink},
+		{"Soft edges", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Per-segment confidence is in --json.", ink},
+		{"Detected", sources, ink},
 	}
-	return panelStyle(width).Render(strings.Join(copy, "\n"))
+
+	lines := []string{heading("METHOD & LIMITS", "use the number, know its edges"), ""}
+	for _, row := range rows {
+		body := strings.Split(wrap(row.body, inner-labelWidth-1), "\n")
+		for index, line := range body {
+			label := ""
+			if index == 0 {
+				label = row.label
+			}
+			lines = append(lines,
+				lipgloss.NewStyle().Width(labelWidth).Foreground(row.colour).Bold(index == 0).Render(label)+
+					" "+lipgloss.NewStyle().Foreground(muted).Render(line))
+		}
+		lines = append(lines, "")
+	}
+	return box(width).Render(strings.Join(lines[:len(lines)-1], "\n"))
+}
+
+func (m Model) empty(width int) string {
+	return box(width).Render(strings.Join([]string{
+		lipgloss.NewStyle().Foreground(blocked).Bold(true).Render("No recent supported traces found"),
+		"",
+		lipgloss.NewStyle().Foreground(muted).Render(wrap(
+			"Looked in ~/.codex/sessions, ~/.claude/projects, ~/.cursor/projects and ~/.grok/sessions.", width-4)),
+		"",
+		lipgloss.NewStyle().Foreground(ink).Render("Widen the window:") + lipgloss.NewStyle().Foreground(working).Render("  wasted-cycles --days 30"),
+		lipgloss.NewStyle().Foreground(ink).Render("See the interface:") + lipgloss.NewStyle().Foreground(working).Render("  wasted-cycles --demo"),
+	}, "\n"))
 }
 
 func inferredNote(report analyze.Report) string {
 	if report.Inferred <= 0 || report.Observed <= 0 {
-		return "No time in this report came from a clamped gap."
+		return "Nothing in this report came from a capped gap."
 	}
-	return fmt.Sprintf("In this report %s of %s observed (%s) is clamped rather than measured.",
-		duration(report.Inferred), duration(report.Observed), percent(report.Inferred, report.Observed))
+	return fmt.Sprintf("Here %s of %s agent time (%s) is capped rather than measured.",
+		duration(report.Inferred), duration(report.Observed), share(report.Inferred, report.Observed))
 }
 
-func (m Model) empty(width int) string {
-	lines := []string{
-		lipgloss.NewStyle().Foreground(yellow).Bold(true).Render("No recent supported traces found"),
-		"",
-		wrap("Wasted Cycles looked in ~/.codex/sessions, ~/.claude/projects, ~/.cursor/projects, and ~/.grok/sessions.", width-6),
-		"",
-		lipgloss.NewStyle().Foreground(ink).Render("Try a wider window:"),
-		lipgloss.NewStyle().Foreground(lime).Render("  wasted-cycles --days 30"),
-		"",
-		lipgloss.NewStyle().Foreground(ink).Render("Or explore the complete interface:"),
-		lipgloss.NewStyle().Foreground(lime).Render("  wasted-cycles --demo"),
-	}
-	return panelStyle(width).Render(strings.Join(lines, "\n"))
-}
-
-func statCard(width int, label, value, note string, color lipgloss.Color) string {
-	content := lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Foreground(muted).Bold(true).Render(label),
-		lipgloss.NewStyle().Foreground(color).Bold(true).Render(value),
-		lipgloss.NewStyle().Foreground(muted).Render(note),
-	)
+func card(width int, label, value, note string, colour lipgloss.Color) string {
 	return lipgloss.NewStyle().
-		Width(width-1).
-		Height(4).
-		Padding(0, 1).
-		MarginRight(1).
+		Width(width-1).Height(4).Padding(0, 1).MarginRight(1).
 		Background(panel).
-		Border(lipgloss.NormalBorder(), false, false, true, false).
-		BorderForeground(faint).
-		Render(content)
+		Border(lipgloss.NormalBorder(), false, false, true, false).BorderForeground(faint).
+		Render(lipgloss.JoinVertical(lipgloss.Left,
+			lipgloss.NewStyle().Foreground(muted).Bold(true).Render(truncate(label, width-3)),
+			lipgloss.NewStyle().Foreground(colour).Bold(true).Render(truncate(value, width-3)),
+			lipgloss.NewStyle().Foreground(muted).Render(truncate(note, width-3)),
+		))
 }
 
-func panelStyle(width int) lipgloss.Style {
+func box(width int) lipgloss.Style {
 	return lipgloss.NewStyle().Width(width).Padding(1, 2).Background(panel)
 }
 
-func sectionTitle(title, note string) string {
+func heading(title, note string) string {
 	return lipgloss.NewStyle().Bold(true).Foreground(ink).Render(title) + "  " +
 		lipgloss.NewStyle().Foreground(muted).Render(note)
 }
 
-func segmentBar(segments []analyze.Segment, total time.Duration, width int) string {
-	if total <= 0 {
-		return strings.Repeat("░", width)
+func spread(left, right string, width int) string {
+	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		return truncate(left, width)
 	}
-	var builder strings.Builder
-	used := 0
-	for index, segment := range segments {
-		size := int(math.Round(float64(segment.Duration) / float64(total) * float64(width)))
-		if size < 1 {
-			size = 1
-		}
-		if index == len(segments)-1 || used+size > width {
-			size = width - used
-		}
-		if size <= 0 {
-			break
-		}
-		builder.WriteString(lipgloss.NewStyle().Foreground(categoryColor(segment.Category)).Render(strings.Repeat("█", size)))
-		used += size
-	}
-	if used < width {
-		builder.WriteString(lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("░", width-used)))
-	}
-	return builder.String()
-}
-
-func legend(width int) string {
-	items := []struct {
-		id, label string
-	}{
-		{"reasoning", "model"}, {"explore", "read"}, {"edit", "edit"},
-		{"verify", "test"}, {"tool_other", "other"}, {"ci_wait", "CI"},
-		{"human_wait", "human"}, {"agent_wait", "agents"}, {"retry", "retry"},
-	}
-	var rendered []string
-	for _, item := range items {
-		rendered = append(rendered,
-			lipgloss.NewStyle().Foreground(categoryColor(item.id)).Render("■")+" "+
-				lipgloss.NewStyle().Foreground(muted).Render(item.label),
-		)
-	}
-	return truncate(strings.Join(rendered, "   "), width)
-}
-
-func categoryColor(category string) lipgloss.Color {
-	switch category {
-	case "reasoning":
-		return purple
-	case "explore":
-		return blue
-	case "edit":
-		return lime
-	case "verify":
-		return teal
-	case "tool_other":
-		return slate
-	case "ci_wait":
-		return orange
-	case "agent_wait":
-		return yellow
-	case "human_wait":
-		return red
-	case "dependency_wait":
-		return lipgloss.Color("#C084FC")
-	case "retry":
-		return lipgloss.Color("#FB7185")
-	default:
-		return muted
-	}
-}
-
-func categoryDuration(report analyze.Report, id string) time.Duration {
-	for _, category := range report.Categories {
-		if category.ID == id {
-			return category.Duration
-		}
-	}
-	return 0
+	return left + strings.Repeat(" ", gap) + right
 }
 
 func duration(value time.Duration) string {
-	if value < time.Minute {
+	switch {
+	case value < time.Minute:
 		return fmt.Sprintf("%ds", int(value.Seconds()))
+	case value < time.Hour:
+		return fmt.Sprintf("%dm", int(value.Minutes()))
+	default:
+		return fmt.Sprintf("%dh %02dm", int(value.Hours()), int(value.Minutes())%60)
 	}
-	hours := int(value.Hours())
-	minutes := int(value.Minutes()) % 60
-	if hours > 0 {
-		return fmt.Sprintf("%dh %02dm", hours, minutes)
-	}
-	return fmt.Sprintf("%dm", minutes)
 }
 
-func percent(value, total time.Duration) string {
+func share(value, total time.Duration) string {
 	if total <= 0 {
 		return "—"
 	}
 	return fmt.Sprintf("%.0f%%", float64(value)/float64(total)*100)
 }
 
-func throughputLabel(value float64) string {
+func verdict(value float64) string {
 	switch {
+	case value >= .95:
+		return "rarely blocked"
 	case value >= .8:
-		return "strong flow"
-	case value >= .6:
 		return "room to recover"
 	default:
-		return "critical path blocked"
+		return "path blocked"
 	}
 }
 
 func relativePeriod(since time.Time) string {
-	days := int(time.Since(since).Hours() / 24)
-	if days < 1 {
-		return "24h"
+	if days := int(time.Since(since).Hours() / 24); days >= 1 {
+		return fmt.Sprintf("%dd", days)
 	}
-	return fmt.Sprintf("%dd", days)
+	return "24h"
 }
 
 func truncate(value string, width int) string {
 	if width < 1 {
 		return ""
 	}
-	if lipgloss.Width(value) <= width {
+	if ansi.StringWidth(value) <= width {
 		return value
 	}
 	if width == 1 {
@@ -519,15 +523,15 @@ func wrap(value string, width int) string {
 		return value
 	}
 	var lines []string
-	words := strings.Fields(value)
 	current := ""
-	for _, word := range words {
-		if lipgloss.Width(current)+1+lipgloss.Width(word) > width && current != "" {
+	for _, word := range strings.Fields(value) {
+		switch {
+		case current == "":
+			current = word
+		case lipgloss.Width(current)+1+lipgloss.Width(word) > width:
 			lines = append(lines, current)
 			current = word
-		} else if current == "" {
-			current = word
-		} else {
+		default:
 			current += " " + word
 		}
 	}
@@ -535,18 +539,4 @@ func wrap(value string, width int) string {
 		lines = append(lines, current)
 	}
 	return strings.Join(lines, "\n")
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

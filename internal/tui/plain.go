@@ -8,11 +8,12 @@ import (
 	"github.com/zozo123/wasted-cycles/internal/analyze"
 )
 
+// Plain is what a pipe, a redirect, or a CI job gets instead of the TUI.
 func Plain(report analyze.Report) string {
 	var lines []string
 	add := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 
-	scope := fmt.Sprintf("last %s · %d traces scanned", relativePeriod(report.Since), report.Scanned)
+	scope := fmt.Sprintf("last %s · %d traces", relativePeriod(report.Since), report.Scanned)
 	if report.IsDemo {
 		scope = "demo dataset"
 	}
@@ -21,33 +22,54 @@ func Plain(report analyze.Report) string {
 	if len(report.Sessions) == 0 {
 		add("No recent supported traces found in ~/.codex/sessions, ~/.claude/projects,")
 		add("~/.cursor/projects, or ~/.grok/sessions.")
-		add("Try a wider window with --days 30, or explore the interface with --demo.")
+		add("Widen the window with --days 30, or see the interface with --demo.")
 		return strings.Join(lines, "\n")
 	}
 
-	add("Observed        %s", duration(report.Observed))
-	add("Model work      %s of observed", percent(categoryDuration(report, "reasoning"), report.Observed))
-	add("Recoverable     %s (blocked + repeated)", duration(report.Recoverable))
-	add("Throughput      %.0f%% (%s)", report.Throughput*100, throughputLabel(report.Throughput))
+	add("Agent time         %s   (excludes time waiting on you)", duration(report.Observed))
+	add("Blocked on compute %s   %s of agent time", duration(report.Blocked), share(report.Blocked, report.Observed))
+	add("Throughput         %-9s %s", fmt.Sprintf("%.0f%%", report.Throughput*100), verdict(report.Throughput))
+	add("Outside the loop   %s   waiting on you, not counted", duration(report.Human))
 	add("")
+
 	add("WHERE THE TIME WENT")
-	maximum := time.Duration(0)
+	peak := time.Duration(0)
 	for _, category := range report.Categories {
-		if category.Duration > maximum {
-			maximum = category.Duration
+		if category.Duration > peak {
+			peak = category.Duration
 		}
 	}
-	for _, category := range report.Categories {
-		fill := 0
-		if maximum > 0 {
-			fill = int(float64(category.Duration) / float64(maximum) * 32)
+	for _, group := range []struct{ id, title string }{
+		{analyze.GroupWorking, "agent working"},
+		{analyze.GroupBlocked, "blocked on compute"},
+		{analyze.GroupExcluded, "not counted"},
+	} {
+		first := true
+		for _, category := range report.Categories {
+			if category.Group != group.id || category.Duration == 0 {
+				continue
+			}
+			if first {
+				add("  [%s]", group.title)
+				first = false
+			}
+			fill := 0
+			if peak > 0 {
+				fill = int(float64(category.Duration) / float64(peak) * 28)
+			}
+			glyph := "#"
+			if group.id == analyze.GroupBlocked {
+				glyph = "="
+			} else if group.id == analyze.GroupExcluded {
+				glyph = "."
+			}
+			add("    %-24s %9s  %s", category.Label, duration(category.Duration), strings.Repeat(glyph, fill))
 		}
-		add("  %-20s %9s  %s", category.Label, duration(category.Duration), strings.Repeat("#", fill))
 	}
 
 	if len(report.Findings) > 0 {
 		add("")
-		add("BIGGEST LEAKS")
+		add("BIGGEST STALLS")
 		for index, finding := range report.Findings {
 			if index >= 3 {
 				break
@@ -72,9 +94,11 @@ func Plain(report analyze.Report) string {
 			session.Provider, truncate(session.Project, 24), duration(session.Duration),
 			session.Throughput*100, note)
 	}
+
 	add("")
-	add("Model work is an inference proxy, not measured GPU time.")
+	add("A wasted cycle is time blocked on a machine: builds, tests, CI, containers,")
+	add("packages, sub-agents. Time waiting on a person is reported but never counted.")
 	add("%s", inferredNote(report))
-	add("Run with --json for the full report, or in an interactive terminal for the TUI.")
+	add("Run with --json for the full report, or in a terminal for the TUI.")
 	return strings.Join(lines, "\n")
 }

@@ -194,13 +194,194 @@ func commandOf(input map[string]any) string {
 	return ""
 }
 
+// Needle lists are scanned in the order used by classifyCommand. Every needle is
+// a lowercase substring matched against a normalized command, so each one must
+// carry enough context to be unambiguous: bare tool names ("act", "aws", "kind",
+// "travis") collide with English words, file paths, and YAML filenames that the
+// agent merely reads or edits.
 var (
-	ciNeedles         = []string{"gh run watch", "gh run view", "gh pr checks", "gh workflow run", "circleci", "buildkite", "gitlab-ci", "az pipelines", "waiting for ci"}
-	verifyNeedles     = []string{"go test", "go vet", "go build", "golangci-lint", "cargo test", "cargo build", "cargo clippy", "pytest", "tox ", "nox ", "unittest", "npm test", "npm run test", "npm run build", "pnpm test", "pnpm build", "yarn test", "vitest", "jest", "mocha", "rspec", "rake test", "mvn test", "mvn verify", "gradle test", "gradlew test", "ctest", "make test", "make check", "make build", "tsc ", "eslint", "ruff ", "mypy", "flake8", "shellcheck", "dotnet test", "phpunit", "bats "}
-	dependencyNeedles = []string{"npm install", "npm ci", "pnpm install", "yarn install", "pip install", "uv pip", "uv sync", "poetry install", "cargo fetch", "go mod download", "go mod tidy", "bundle install", "gem install", "brew install", "apt-get", "apk add", "docker build", "docker pull", "docker compose", "git clone", "git fetch", "git pull", "git push", "curl ", "wget "}
-	editNeedles       = []string{"sed -i", "git commit", "git add", "git checkout", "git switch", "git rebase", "git merge", "mkdir ", "chmod ", "mv ", "rm -", "touch "}
-	exploreNeedles    = []string{"git status", "git diff", "git log", "git show", "gh api", "gh pr view", "gh issue", "ls ", "ls -", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "sed -n", "awk ", "wc ", "jq ", "tree ", "which ", "pwd", "du ", "stat "}
+	// Hosted pipelines the agent watches or polls. The machine doing the work is
+	// a remote CI fleet; the local process only blocks on its verdict.
+	ciNeedles = []string{
+		"gh run watch", "gh run view", "gh run list", "gh run rerun", "gh pr checks",
+		"gh workflow run", "gh workflow view", "gh cache",
+		"circleci local", "circleci pipeline", "circleci config validate",
+		"buildkite-agent", "glab ci", "gitlab-runner", "az pipelines", "jenkins-cli",
+		"drone build", "drone exec", "teamcity", "travis ", "argo submit",
+		"aws codebuild", "aws codepipeline",
+		"act -j", "act pull_request", "act workflow_dispatch",
+		"waiting for ci", "waiting for checks",
+	}
+	// Containers, VMs, clusters and cloud infrastructure being provisioned,
+	// deployed to, or polled. Nothing here compiles source.
+	containerNeedles = []string{
+		"docker compose up", "docker-compose up", "docker compose start", "docker stack deploy",
+		"docker swarm", "podman run", "podman compose", "podman machine",
+		"colima start", "lima start", "orbstack start", "minikube start", "minikube delete",
+		"kind create cluster", "kind delete cluster", "kind load", "k3d cluster",
+		"devcontainer up", "vagrant up", "vagrant provision", "packer build",
+		"kubectl apply", "kubectl wait", "kubectl rollout", "kubectl logs -f", "kubectl port-forward",
+		"kubectl delete", "kubectl create", "kubectl exec", "kubectl top",
+		"helm install", "helm upgrade", "helm uninstall", "helm rollback",
+		"skaffold dev", "skaffold run", "skaffold debug", "tilt up", "argocd app sync",
+		"terraform apply", "terraform plan", "terraform init", "terraform destroy", "terraform refresh",
+		"tofu apply", "tofu plan", "pulumi up", "pulumi preview", "pulumi destroy",
+		"cdk deploy", "cdk destroy", "ansible-playbook",
+		"aws cloudformation", "aws ecs ", "aws eks ", "aws ec2 ", "aws lambda ", "aws s3 sync",
+		"aws logs tail", "aws elasticbeanstalk", "aws ssm start-session",
+		"gcloud run deploy", "gcloud container clusters", "gcloud compute instances", "gcloud sql",
+		"az deployment", "az aks ", "az vm ", "az webapp", "az containerapp",
+		"fly deploy", "flyctl deploy", "vercel deploy", "vercel --prod", "netlify deploy",
+		"railway up", "heroku ps", "heroku logs", "git push heroku", "wrangler deploy", "nsc cluster",
+	}
+	// Compilation, linking, bundling, codegen and image builds of source. Remote
+	// and distributed build farms belong here too: the work is still a compile,
+	// it just happens on someone else's cores.
+	buildNeedles = []string{
+		// Go
+		"go build", "go install", "go generate", "go run ",
+		// Rust
+		// "cross build --" rather than "cross build": the shorter form is a
+		// substring of the English phrase "across build", which showed up in real
+		// traces. Note that "cargo build"/"cargo run"/"cargo test" likewise contain
+		// "go build"/"go run"/"go test"; that overlap is harmless because both
+		// sides of it land in the same bucket.
+		"cargo build", "cargo check", "cargo rustc", "cargo run", "cross build --",
+		// C / C++ / native toolchains. Bare compiler names are unusable as
+		// substrings -- "cl", "ld", "gcc" and "clang" match "incl", "should",
+		// "gcc/clang builds add .cxx" and "apt-get install clang lld" far more
+		// often than an actual compile -- so each one carries a flag.
+		"gcc -c ", "gcc -o ", "gcc -std", "g++ ", "clang -c ", "clang -o ", "clang -std",
+		"clang++ ", "cl.exe", "nvcc ", "cmake --build", "cmake -b ",
+		"ninja -c ", "ninja -j", "ninja -f ", "meson compile", "meson setup", "waf build",
+		// JVM
+		"mvn compile", "mvn package", "mvn install", "gradle build", "gradlew build",
+		"gradle assemble", "gradlew assemble", "gradle compile", "gradlew compile",
+		"javac ", "sbt compile", "sbt package", "kotlinc ", "scalac ",
+		// .NET. "dotnet restore" is deliberately absent: a NuGet restore is a
+		// registry fetch and belongs in dependencyNeedles, not here.
+		"dotnet build", "dotnet publish", "dotnet msbuild", "dotnet run",
+		// Swift / Zig / Nim / Haskell / BEAM
+		"swift build", "nim c ", "nim cpp ", "nimble build", "stack build", "cabal build",
+		"mix compile", "mix deps.compile", "rebar3 compile",
+		// Bazel / Buck
+		"bazel build", "bazel run", "buck2 build", "buck build", "protoc ", "cdk synth",
+		// Frontend bundlers that are genuinely compile-shaped. Each needle avoids
+		// the tool's own config filename: bare "rollup" matches gh's
+		// statusCheckRollup, and bare "webpack"/"vite"/"esbuild" match
+		// webpack.config.js, vite.config.ts and node_modules/.bin/esbuild.
+		"npm run build", "pnpm build", "pnpm run build", "yarn build", "yarn run build",
+		"bun run build", "vite build", "next build", "turbo build", "turbo run build",
+		"nx build", "parcel build", "rollup -c", "rollup --config", "npx rollup",
+		"webpack --", "npx webpack", "esbuild --bundle", "npx esbuild",
+		"tsc -b", "tsc --build", "tsc -p ", ".bin/tsc",
+		// Make targets that are unambiguously a build. Bare "make" is handled by
+		// buildPrefixes so that "make test" can still reach testNeedles.
+		"make build", "make all", "make -j", "make compile",
+		// Image builds of source.
+		"docker build", "docker buildx", "buildah bud", "buildah build", "kaniko",
+		"pack build", "ko build", "nix build", "nix-build",
+		// Remote / distributed execution of a compile.
+		"--remote_executor", "--config=remote", "--remote_cache",
+		"depot build", "depot bake", "earthly ", "dagger call", "dagger run", "nsc build",
+		"skaffold build",
+		"gcloud builds submit", "az acr build",
+		// Incredibuild. Bare "incredibuild" is unusable: across 79k real commands
+		// it appears overwhelmingly as an org name (incredibuild-rnd/...), an
+		// install path (/opt/incredibuild/bin) or a hostname, and almost never as
+		// a command. The console binaries are the real invocation.
+		// Compiler caches and distributors (ccache, sccache, distcc) are
+		// deliberately absent: they only ever appear as a wrapper -- "sccache g++
+		// -c x.cpp" -- so the wrapped compiler above already matches, while the
+		// bare names collide with the code-search queries agents run about them.
+		"ib_console ", "ibconsole ", "buildconsole ",
+	}
+	// Test, lint and typecheck execution.
+	testNeedles = []string{
+		// Go
+		"go test", "go vet", "golangci-lint", "gotestsum", "staticcheck",
+		// Rust
+		"cargo test", "cargo nextest", "cargo clippy", "cargo miri",
+		// C / C++
+		"ctest", "bazel test", "clang-tidy", "cppcheck",
+		// Python. "-m unittest" rather than bare "unittest": the bare form matches
+		// "from unittest.mock import MagicMock" in every heredoc that stubs a test,
+		// which is source the agent is writing, not a suite it is waiting on.
+		"pytest", "tox ", "nox ", "-m unittest", "-m pytest",
+		"mypy", "pyright", "ruff check", "flake8", "pylint",
+		// JS / TS. Every needle here is kept clear of the tool's own config file:
+		// "eslint " misses .eslintrc, "vitest run" misses vitest.config.ts,
+		// "jest " misses jest.config.js.
+		"npm test", "npm run test", "npm run lint", "npm run typecheck",
+		"pnpm test", "pnpm run test", "pnpm lint", "pnpm typecheck",
+		"yarn test", "bun test", "vitest run", "npx vitest", "exec vitest",
+		"jest ", "npx jest", "mocha ", "playwright test", "cypress run",
+		"eslint ", "npx eslint", "tsc --noemit", "typecheck",
+		// Ruby / PHP / shell
+		"rspec", "rake test", "phpunit", "bats ", "shellcheck",
+		// JVM
+		"mvn test", "mvn verify", "gradle test", "gradlew test", "gradle check", "gradlew check",
+		// .NET / Swift / BEAM / Haskell / Zig
+		"dotnet test", "swift test", "xcodebuild test", "mix test", "stack test",
+		"cabal test", "zig build test",
+		// Make targets and commit gates
+		"make test", "make check", "make lint", "make verify", "pre-commit run", "prek run",
+	}
+	// Weak container signals: these run *something* inside a container, so the
+	// payload decides the bucket. Scanned after build and test needles so that
+	// "docker run ... pytest" stays a test wait.
+	containerRunNeedles = []string{
+		"docker run ", "docker start ", "docker exec ", "docker attach", "docker wait",
+		"docker compose run", "docker compose exec", "nerdctl run",
+	}
+	dependencyNeedles = []string{
+		"npm install", "npm ci", "pnpm install", "yarn install", "pip install", "uv pip", "uv sync",
+		"poetry install", "cargo fetch", "cargo update", "go mod download", "go mod tidy",
+		"go mod vendor", "bundle install", "gem install", "composer install", "bun install",
+		// Package restores for compiled ecosystems. These are registry fetches, not
+		// compiles: "dotnet restore" pulls NuGet packages while "dotnet build"
+		// invokes the compiler, and the two must not share a bucket.
+		"dotnet restore", "nuget restore", "mix deps.get", "rebar3 get-deps",
+		"gradle --refresh-dependencies", "swift package resolve", "cabal update",
+		"brew install", "apt-get", "apt install", "apk add", "yum install", "dnf install",
+		"pacman -s ", "choco install", "winget install", "conda install", "rustup ",
+		"docker pull", "docker push",
+		"podman pull", "helm repo update", "git clone", "git fetch", "git pull", "git push",
+		"curl ", "wget ",
+	}
+	editNeedles    = []string{"sed -i", "git commit", "git add", "git checkout", "git switch", "git rebase", "git merge", "mkdir ", "chmod ", "mv ", "rm -", "touch "}
+	exploreNeedles = []string{"git status", "git diff", "git log", "git show", "gh api", "gh pr view", "gh issue", "kubectl get", "kubectl describe", "docker ps", "docker images", "terraform fmt", "terraform validate", "helm template", "kustomize build", "ls ", "ls -", "cat ", "head ", "tail ", "grep ", "rg ", "find ", "sed -n", "awk ", "wc ", "jq ", "tree ", "which ", "pwd", "du ", "stat "}
 )
+
+// Build tools whose bare name is only safe at the very start of a command.
+// normalizeCommand has already stripped shell wrappers and leading "cd X &&"
+// hops, so a prefix match here really is the command being invoked. Anchoring is
+// what makes these shippable at all: as free substrings "make" also matches
+// "makefile", "makemigrations" and "make sure", and across 79k real commands
+// bare "make " fired 138 times but only 27 at the start of a command -- of which
+// 24 were genuine invocations.
+//
+// This is checked *after* testNeedles so that "make test", "gradlew check" and
+// "xcodebuild test" reach their own bucket instead of being swallowed as builds.
+var (
+	buildPrefixes = []string{
+		"make ", "ninja", "cmake ", "msbuild ", "meson ", "scons", "mvn ",
+		"gradlew ", "./gradlew ", "xcodebuild", "zig ", "waf ",
+	}
+	bareBuildCommands = set("make", "ninja", "scons", "msbuild", "xcodebuild")
+)
+
+func hasBuildPrefix(command string) bool {
+	if bareBuildCommands[command] {
+		return true
+	}
+	for _, prefix := range buildPrefixes {
+		if strings.HasPrefix(command, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 func classifyCommand(raw string) (string, string, string) {
 	command := normalizeCommand(raw)
@@ -215,8 +396,18 @@ func classifyCommand(raw string) (string, string, string) {
 	switch {
 	case containsAny(window, ciNeedles...):
 		return "ci_wait", "CI feedback", key
-	case containsAny(window, verifyNeedles...):
-		return "verify", "test suite", key
+	case containsAny(window, containerNeedles...):
+		return "container_wait", "container / infra wait", key
+	case containsAny(window, buildNeedles...):
+		return "build_wait", "build", key
+	case containsAny(window, testNeedles...):
+		return "test_wait", "test suite", key
+	case hasBuildPrefix(command):
+		return "build_wait", "build", key
+	case containsAny(window, containerRunNeedles...):
+		return "container_wait", "container / infra wait", key
+	case isInfraPoll(window):
+		return "container_wait", "polling for readiness", key
 	case containsAny(window, dependencyNeedles...):
 		return "dependency_wait", "dependency / network", key
 	case containsAny(window, editNeedles...):
@@ -226,6 +417,18 @@ func classifyCommand(raw string) (string, string, string) {
 	default:
 		return "tool_other", "shell command", ""
 	}
+}
+
+// Sleep, watch and until loops only mean "blocked on infrastructure" when they
+// are polling something. On their own they are far too generic: a heredoc that
+// writes time.sleep(1) into a script is an edit, not a wait.
+var (
+	pollPrimitives   = []string{"sleep ", "watch -n", "until ", "while ! ", "timeout "}
+	pollInfraTargets = []string{"kubectl ", "docker ", "helm ", "minikube", "nc -z", "pg_isready", "/healthz", "/readyz", "localhost:", "127.0.0.1:"}
+)
+
+func isInfraPoll(window string) bool {
+	return containsAny(window, pollPrimitives...) && containsAny(window, pollInfraTargets...)
 }
 
 func normalizeCommand(raw string) string {
