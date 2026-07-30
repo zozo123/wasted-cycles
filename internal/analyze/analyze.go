@@ -4,20 +4,23 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type Options struct {
 	Since    time.Time
 	MaxGap   time.Duration
+	IdleGap  time.Duration
 	MaxFiles int
+	Workers  int
 }
 
 type Category struct {
@@ -35,6 +38,7 @@ type Segment struct {
 	Provider   string        `json:"provider"`
 	SessionID  string        `json:"session_id"`
 	Confidence float64       `json:"confidence"`
+	Clamped    bool          `json:"clamped"`
 	Duration   time.Duration `json:"duration_ns"`
 }
 
@@ -47,6 +51,7 @@ type Session struct {
 	End        time.Time     `json:"end"`
 	Duration   time.Duration `json:"duration_ns"`
 	Throughput float64       `json:"throughput"`
+	Resolution string        `json:"resolution"`
 	Segments   []Segment     `json:"segments"`
 }
 
@@ -68,6 +73,7 @@ type Report struct {
 	Since       time.Time     `json:"since"`
 	Observed    time.Duration `json:"observed_ns"`
 	Recoverable time.Duration `json:"recoverable_ns"`
+	Inferred    time.Duration `json:"inferred_ns"`
 	Throughput  float64       `json:"throughput"`
 	Sessions    []Session     `json:"sessions"`
 	Categories  []Category    `json:"categories"`
@@ -85,14 +91,22 @@ type candidate struct {
 }
 
 type event struct {
-	At       time.Time
-	Category string
-	Label    string
-	Key      string
+	At         time.Time
+	Kind       eventKind
+	Category   string
+	Label      string
+	Key        string
+	Confidence float64
 }
 
+const (
+	resolutionEvent = "event"
+	resolutionTurn  = "turn"
+	maxLineBytes    = 4 << 20
+)
+
 var categoryOrder = []string{
-	"reasoning", "explore", "edit", "verify", "ci_wait",
+	"reasoning", "explore", "edit", "verify", "tool_other", "ci_wait",
 	"agent_wait", "human_wait", "dependency_wait", "retry", "unknown",
 }
 
@@ -101,6 +115,7 @@ var categoryLabels = map[string]string{
 	"explore":         "Read & search",
 	"edit":            "Code changes",
 	"verify":          "Local verify",
+	"tool_other":      "Other tool work",
 	"ci_wait":         "Waiting for CI",
 	"agent_wait":      "Waiting for agents",
 	"human_wait":      "Waiting for human",
@@ -109,13 +124,24 @@ var categoryLabels = map[string]string{
 	"unknown":         "Unclassified",
 }
 
+func (o Options) withDefaults() Options {
+	if o.MaxGap <= 0 {
+		o.MaxGap = 30 * time.Minute
+	}
+	if o.IdleGap <= o.MaxGap {
+		o.IdleGap = max(2*time.Hour, 4*o.MaxGap)
+	}
+	if o.MaxFiles <= 0 {
+		o.MaxFiles = 600
+	}
+	if o.Workers <= 0 {
+		o.Workers = runtime.NumCPU()
+	}
+	return o
+}
+
 func Run(opts Options) (Report, error) {
-	if opts.MaxGap <= 0 {
-		opts.MaxGap = 30 * time.Minute
-	}
-	if opts.MaxFiles <= 0 {
-		opts.MaxFiles = 600
-	}
+	opts = opts.withDefaults()
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Report{}, err
@@ -129,24 +155,55 @@ func Run(opts Options) (Report, error) {
 		candidates = candidates[:opts.MaxFiles]
 	}
 
-	report := Report{GeneratedAt: time.Now(), Since: opts.Since, Skipped: skipped}
-	sourceCounts := map[string]int{}
-	for _, file := range candidates {
-		session, ok := parseSession(file, opts)
-		if !ok {
-			continue
-		}
+	report := Report{GeneratedAt: time.Now(), Since: opts.Since, Skipped: skipped, Scanned: len(candidates)}
+	for _, session := range parseAll(candidates, opts) {
 		report.Sessions = append(report.Sessions, session)
-		sourceCounts[file.Provider]++
 	}
-	report.Scanned = len(candidates)
-	sort.Slice(report.Sessions, func(i, j int) bool { return report.Sessions[i].End.After(report.Sessions[j].End) })
+
+	sourceCounts := map[string]int{}
+	for _, session := range report.Sessions {
+		sourceCounts[session.Provider]++
+	}
+	sort.SliceStable(report.Sessions, func(i, j int) bool { return report.Sessions[i].End.After(report.Sessions[j].End) })
 	for provider, files := range sourceCounts {
 		report.Sources = append(report.Sources, Source{Provider: provider, Files: files})
 	}
 	sort.Slice(report.Sources, func(i, j int) bool { return report.Sources[i].Provider < report.Sources[j].Provider })
 	finalize(&report)
 	return report, nil
+}
+
+func parseAll(candidates []candidate, opts Options) []Session {
+	results := make([]Session, len(candidates))
+	found := make([]bool, len(candidates))
+
+	queue := make(chan int)
+	var group sync.WaitGroup
+	for worker := 0; worker < opts.Workers; worker++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for index := range queue {
+				if session, ok := parseSession(candidates[index], opts); ok {
+					results[index] = session
+					found[index] = true
+				}
+			}
+		}()
+	}
+	for index := range candidates {
+		queue <- index
+	}
+	close(queue)
+	group.Wait()
+
+	sessions := make([]Session, 0, len(candidates))
+	for index, ok := range found {
+		if ok {
+			sessions = append(sessions, results[index])
+		}
+	}
+	return sessions
 }
 
 func discover(home string, since time.Time) []candidate {
@@ -169,39 +226,51 @@ func discover(home string, since time.Time) []candidate {
 				return nil
 			}
 			if entry.IsDir() {
-				if strings.Contains(path, string(filepath.Separator)+"subagents") {
+				if skipDir(entry.Name()) {
 					return filepath.SkipDir
 				}
 				return nil
 			}
 			name := strings.ToLower(entry.Name())
-			if !strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".txt") {
+			if !strings.HasSuffix(name, ".jsonl") {
 				return nil
 			}
 			if root.Provider == "grok" && name != "updates.jsonl" {
 				return nil
 			}
 			info, err := entry.Info()
-			if err == nil && !info.ModTime().Before(since) {
-				out = append(out, candidate{Path: path, Provider: root.Provider, ModTime: info.ModTime()})
+			if err != nil || !info.Mode().IsRegular() || info.ModTime().Before(since) {
+				return nil
 			}
+			out = append(out, candidate{Path: path, Provider: root.Provider, ModTime: info.ModTime()})
 			return nil
 		})
 	}
 	return out
 }
 
+func skipDir(name string) bool {
+	switch name {
+	case "subagents", "node_modules", ".git", "shell-snapshots", "statsig":
+		return true
+	}
+	return false
+}
+
 func parseSession(file candidate, opts Options) (Session, bool) {
-	events, project := readEvents(file)
-	if len(events) < 2 {
-		if file.Provider == "grok" {
-			events = grokBoundaryEvents(file.Path)
-		}
+	opts = opts.withDefaults()
+	events, project, resolution := readEvents(file)
+	if len(events) < 2 && file.Provider == "grok" {
+		events, resolution = grokBoundaryEvents(file.Path), resolutionTurn
 	}
 	if len(events) < 2 {
 		return Session{}, false
 	}
 	sort.SliceStable(events, func(i, j int) bool { return events[i].At.Before(events[j].At) })
+	events = clampToWindow(events, opts.Since)
+	if len(events) < 2 {
+		return Session{}, false
+	}
 
 	id := strings.TrimSuffix(filepath.Base(file.Path), filepath.Ext(file.Path))
 	if file.Provider == "grok" {
@@ -210,119 +279,192 @@ func parseSession(file candidate, opts Options) (Session, bool) {
 	if project == "" {
 		project = inferProject(file)
 	}
-	session := Session{ID: shortID(id), Provider: file.Provider, Project: project, Path: file.Path}
-	session.Start = events[0].At
-	session.End = events[len(events)-1].At
+	session := Session{
+		ID: shortID(id), Provider: file.Provider, Project: project,
+		Path: file.Path, Resolution: resolution,
+		Start: events[0].At, End: events[len(events)-1].At,
+	}
 
 	seen := map[string]int{}
 	for i := 0; i < len(events)-1; i++ {
 		current, next := events[i], events[i+1]
 		duration := next.At.Sub(current.At)
-		if duration <= 0 {
+		if duration <= 0 || duration > opts.IdleGap {
 			continue
 		}
-		if duration > opts.MaxGap {
+		clamped := duration > opts.MaxGap
+		if clamped {
 			duration = opts.MaxGap
 		}
-		category := current.Category
+		category, label, confidence := interval(current, next)
+		if clamped {
+			confidence = .3
+		}
 		if current.Key != "" {
 			seen[current.Key]++
 			if seen[current.Key] > 1 && (category == "verify" || category == "ci_wait") {
-				category = "retry"
+				category, label = "retry", "repeated "+label
 			}
 		}
-		segment := Segment{
+		session.Segments = append(session.Segments, Segment{
 			Start: current.At, End: current.At.Add(duration), Duration: duration,
-			Category: category, Label: current.Label, Provider: file.Provider,
-			SessionID: session.ID, Confidence: confidenceFor(category, current),
-		}
-		session.Segments = append(session.Segments, segment)
+			Category: category, Label: label, Provider: file.Provider,
+			SessionID: session.ID, Confidence: confidence, Clamped: clamped,
+		})
 		session.Duration += duration
 	}
 	if session.Duration < time.Second {
 		return Session{}, false
 	}
-	active := activeDuration(session.Segments)
-	session.Throughput = float64(active) / float64(session.Duration)
+	session.Throughput = float64(activeDuration(session.Segments)) / float64(session.Duration)
 	return session, true
 }
 
-func readEvents(file candidate) ([]event, string) {
+func clampToWindow(events []event, since time.Time) []event {
+	if since.IsZero() {
+		return events
+	}
+	start := 0
+	for index, item := range events {
+		if item.At.Before(since) {
+			start = index
+			continue
+		}
+		break
+	}
+	if events[start].At.Before(since) {
+		if start == len(events)-1 {
+			return nil
+		}
+		events[start].At = since
+	}
+	return events[start:]
+}
+
+func interval(current, next event) (string, string, float64) {
+	switch current.Kind {
+	case kindToolCall:
+		return current.Category, current.Label, current.Confidence
+	case kindUserInput:
+		return "reasoning", "model response", .85
+	case kindToolResult:
+		return "reasoning", "model response", .8
+	case kindThinking:
+		return "reasoning", "extended thinking", .9
+	case kindAssistantText:
+		if next.Kind == kindUserInput {
+			return "human_wait", "handoff to human", .8
+		}
+		return "reasoning", "model response", .7
+	default:
+		return "unknown", "unclassified event", .35
+	}
+}
+
+func readEvents(file candidate) ([]event, string, string) {
+	if file.Provider == "cursor" {
+		events, project := cursorEvents(file.Path)
+		return events, project, resolutionTurn
+	}
 	handle, err := os.Open(file.Path)
 	if err != nil {
-		return nil, ""
+		return nil, "", resolutionEvent
 	}
 	defer handle.Close()
 
 	var events []event
 	project := ""
-	reader := bufio.NewReaderSize(io.LimitReader(handle, 64<<20), 64<<10)
+	scan := newLineScanner(handle)
 	for {
-		line, readErr := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			var value any
-			if json.Unmarshal(line, &value) == nil {
-				at := findTime(value)
-				if !at.IsZero() {
-					flat := strings.ToLower(flatten(value, 0))
-					category, label, key := classify(flat)
-					events = append(events, event{At: at, Category: category, Label: label, Key: key})
-				}
-				if project == "" {
-					project = findString(value, "cwd", "projectPath", "workspace", "project")
-				}
-			}
-		}
-		if readErr != nil {
+		line, ok := scan()
+		if !ok {
 			break
 		}
+		record, ok := decodeRecord(line)
+		if !ok {
+			continue
+		}
+		if project == "" {
+			project = cleanProject(recordProject(record))
+		}
+		at := recordTime(record)
+		if at.IsZero() {
+			continue
+		}
+		result, ok := classifyRecord(record, file.Provider)
+		if !ok {
+			continue
+		}
+		events = append(events, event{
+			At: at, Kind: result.Kind, Category: result.Category,
+			Label: result.Label, Key: result.Key, Confidence: result.Confidence,
+		})
 	}
-	return events, cleanProject(project)
+	return events, project, resolutionEvent
 }
 
-func classify(flat string) (string, string, string) {
-	switch {
-	case containsAny(flat, "wait_agent", "wait agent", "waiting on agent", "join agents"):
-		return "agent_wait", "agent join", ""
-	case containsAny(flat, "gh run watch", "gh pr checks --watch", "waiting for ci", "github actions", "buildkite-agent", "circleci"):
-		return "ci_wait", "CI feedback", commandKey(flat)
-	case containsAny(flat, "go test", "cargo test", "pytest", "npm test", "pnpm test", "yarn test", "vitest", "jest", "rspec", "mvn test", "gradle test"):
-		return "verify", "test suite", commandKey(flat)
-	case containsAny(flat, "apply_patch", "write_file", "edit_file", "str_replace", "search_replace", "\"name\":\"edit", "\"name\": \"edit"):
-		return "edit", "code change", ""
-	case containsAny(flat, "read_file", "list_dir", "\"name\":\"read", "\"name\": \"read", "\"name\":\"grep", "\"name\": \"grep", "search_query", "glob"):
-		return "explore", "read / search", ""
-	case containsAny(flat, "npm install", "pnpm install", "yarn install", "cargo fetch", "go mod download", "pip install", "curl ", "wget "):
-		return "dependency_wait", "dependency / network", commandKey(flat)
-	case containsAny(flat, "\"role\":\"assistant", "\"role\": \"assistant", "agent_message", "final_answer"):
-		return "human_wait", "handoff to human", ""
-	case containsAny(flat, "\"role\":\"user", "\"role\": \"user", "user_message", "tool_result", "function_call_output"):
-		return "reasoning", "model response", ""
-	case containsAny(flat, "function_call", "tool_use", "tool_call"):
-		return "reasoning", "tool planning", ""
-	default:
-		return "unknown", "unclassified event", ""
+func newLineScanner(handle io.Reader) func() ([]byte, bool) {
+	reader := bufio.NewReaderSize(handle, 64<<10)
+	return func() ([]byte, bool) {
+		var line []byte
+		for {
+			chunk, err := reader.ReadSlice('\n')
+			if len(line)+len(chunk) <= maxLineBytes {
+				line = append(line, chunk...)
+			}
+			if err == bufio.ErrBufferFull {
+				continue
+			}
+			if err != nil {
+				return line, len(line) > 0
+			}
+			return line, true
+		}
 	}
 }
 
-func findTime(value any) time.Time {
-	switch v := value.(type) {
-	case map[string]any:
-		for _, key := range []string{"timestamp", "created_at", "updated_at", "time", "ts"} {
-			if raw, ok := v[key]; ok {
-				if parsed := parseTime(raw); !parsed.IsZero() {
-					return parsed
-				}
+func decodeRecord(line []byte) (map[string]any, bool) {
+	line = trimSpaceBytes(line)
+	if len(line) == 0 || line[0] != '{' {
+		return nil, false
+	}
+	var record map[string]any
+	if json.Unmarshal(line, &record) != nil {
+		return nil, false
+	}
+	return record, true
+}
+
+func trimSpaceBytes(line []byte) []byte {
+	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r' || line[len(line)-1] == ' ' || line[len(line)-1] == '\t') {
+		line = line[:len(line)-1]
+	}
+	for len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+		line = line[1:]
+	}
+	return line
+}
+
+var timeKeys = []string{"timestamp", "created_at", "createdAt", "time", "ts", "started_at", "updated_at"}
+
+func recordTime(record map[string]any) time.Time {
+	if at := timeFrom(record); !at.IsZero() {
+		return at
+	}
+	for _, key := range []string{"payload", "message", "meta"} {
+		if nested, ok := record[key].(map[string]any); ok {
+			if at := timeFrom(nested); !at.IsZero() {
+				return at
 			}
 		}
-		for _, child := range v {
-			if parsed := findTime(child); !parsed.IsZero() {
-				return parsed
-			}
-		}
-	case []any:
-		for _, child := range v {
-			if parsed := findTime(child); !parsed.IsZero() {
+	}
+	return time.Time{}
+}
+
+func timeFrom(record map[string]any) time.Time {
+	for _, key := range timeKeys {
+		if raw, ok := record[key]; ok {
+			if parsed := parseTime(raw); !parsed.IsZero() {
 				return parsed
 			}
 		}
@@ -330,95 +472,62 @@ func findTime(value any) time.Time {
 	return time.Time{}
 }
 
+var projectKeys = []string{"cwd", "projectPath", "workspace", "project", "workspacePath"}
+
+func recordProject(record map[string]any) string {
+	for _, key := range projectKeys {
+		if value, ok := record[key].(string); ok && value != "" {
+			return value
+		}
+	}
+	for _, key := range []string{"payload", "message", "meta"} {
+		if nested, ok := record[key].(map[string]any); ok {
+			for _, field := range projectKeys {
+				if value, ok := nested[field].(string); ok && value != "" {
+					return value
+				}
+			}
+		}
+	}
+	return ""
+}
+
+var timeLayouts = []string{time.RFC3339Nano, "2006-01-02T15:04:05Z0700", "2006-01-02 15:04:05.999999-07:00", "2006-01-02 15:04:05"}
+
 func parseTime(value any) time.Time {
 	switch v := value.(type) {
 	case string:
-		if parsed, err := time.Parse(time.RFC3339Nano, v); err == nil {
-			return parsed
+		for _, layout := range timeLayouts {
+			if parsed, err := time.Parse(layout, v); err == nil {
+				return parsed.UTC()
+			}
 		}
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return unixTime(n)
 		}
 	case float64:
 		return unixTime(int64(v))
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return unixTime(n)
+		}
 	}
 	return time.Time{}
 }
 
 func unixTime(value int64) time.Time {
-	if value <= 0 {
+	switch {
+	case value <= 0:
 		return time.Time{}
-	}
-	if value < 1_000_000_000_000 {
-		return time.Unix(value, 0)
-	}
-	return time.UnixMilli(value)
-}
-
-func flatten(value any, depth int) string {
-	if depth > 7 {
-		return ""
-	}
-	switch v := value.(type) {
-	case map[string]any:
-		var builder strings.Builder
-		for key, child := range v {
-			builder.WriteString(key)
-			builder.WriteByte(':')
-			builder.WriteString(flatten(child, depth+1))
-			builder.WriteByte(' ')
-		}
-		return builder.String()
-	case []any:
-		var builder strings.Builder
-		for _, child := range v {
-			builder.WriteString(flatten(child, depth+1))
-			builder.WriteByte(' ')
-		}
-		return builder.String()
-	case string:
-		if len(v) > 800 {
-			return v[:800]
-		}
-		return v
-	case float64, bool:
-		return fmt.Sprint(v)
+	case value < 1e11:
+		return time.Unix(value, 0).UTC()
+	case value < 1e14:
+		return time.UnixMilli(value).UTC()
+	case value < 1e17:
+		return time.UnixMicro(value).UTC()
 	default:
-		return ""
+		return time.Unix(0, value).UTC()
 	}
-}
-
-func findString(value any, keys ...string) string {
-	keySet := map[string]bool{}
-	for _, key := range keys {
-		keySet[strings.ToLower(key)] = true
-	}
-	var walk func(any) string
-	walk = func(current any) string {
-		switch v := current.(type) {
-		case map[string]any:
-			for key, child := range v {
-				if keySet[strings.ToLower(key)] {
-					if text, ok := child.(string); ok {
-						return text
-					}
-				}
-			}
-			for _, child := range v {
-				if found := walk(child); found != "" {
-					return found
-				}
-			}
-		case []any:
-			for _, child := range v {
-				if found := walk(child); found != "" {
-					return found
-				}
-			}
-		}
-		return ""
-	}
-	return walk(value)
 }
 
 func grokBoundaryEvents(path string) []event {
@@ -426,36 +535,22 @@ func grokBoundaryEvents(path string) []event {
 	if err != nil {
 		return nil
 	}
-	var value any
-	if json.Unmarshal(raw, &value) != nil {
+	var record map[string]any
+	if json.Unmarshal(raw, &record) != nil {
 		return nil
 	}
-	start := parseTime(findRaw(value, "created_at"))
-	end := parseTime(findRaw(value, "updated_at"))
+	start := parseTime(record["created_at"])
+	end := parseTime(record["updated_at"])
 	if end.IsZero() {
-		end = parseTime(findRaw(value, "last_active_at"))
+		end = parseTime(record["last_active_at"])
 	}
 	if start.IsZero() || end.IsZero() || !end.After(start) {
 		return nil
 	}
 	return []event{
-		{At: start, Category: "reasoning", Label: "Grok Build session"},
-		{At: end, Category: "unknown", Label: "session end"},
+		{At: start, Kind: kindToolCall, Category: "reasoning", Label: "Grok Build session", Confidence: .4},
+		{At: end, Kind: kindOther, Label: "session end", Confidence: .4},
 	}
-}
-
-func findRaw(value any, key string) any {
-	if object, ok := value.(map[string]any); ok {
-		if raw, found := object[key]; found {
-			return raw
-		}
-		for _, child := range object {
-			if raw := findRaw(child, key); raw != nil {
-				return raw
-			}
-		}
-	}
-	return nil
 }
 
 func finalize(report *Report) {
@@ -464,6 +559,9 @@ func finalize(report *Report) {
 		report.Observed += session.Duration
 		for _, segment := range session.Segments {
 			totals[segment.Category] += segment.Duration
+			if segment.Clamped {
+				report.Inferred += segment.Duration
+			}
 		}
 	}
 	for _, id := range categoryOrder {
@@ -542,23 +640,51 @@ func cleanProject(raw string) string {
 		return "unknown"
 	}
 	raw = strings.TrimPrefix(raw, "file://")
-	raw = strings.TrimSuffix(raw, string(filepath.Separator))
+	raw = strings.TrimRight(raw, "/"+string(filepath.Separator))
 	base := filepath.Base(raw)
 	if base == "." || base == string(filepath.Separator) || base == "" {
 		return "unknown"
 	}
-	if strings.HasPrefix(base, "-Users-") {
+	if strings.HasPrefix(base, "-") || strings.HasPrefix(base, "Users-") {
 		parts := strings.Split(strings.Trim(base, "-"), "-")
-		return parts[len(parts)-1]
+		if last := parts[len(parts)-1]; last != "" {
+			return last
+		}
 	}
 	return base
 }
 
 func shortID(id string) string {
+	if token := longestHexRun(id); len(token) >= 8 {
+		return token[:8]
+	}
 	if len(id) > 10 {
 		return id[:10]
 	}
 	return id
+}
+
+func longestHexRun(id string) string {
+	best, start := "", -1
+	for index := 0; index <= len(id); index++ {
+		if index < len(id) && isHexDigit(id[index]) {
+			if start < 0 {
+				start = index
+			}
+			continue
+		}
+		if start >= 0 {
+			if run := id[start:index]; len(run) > len(best) {
+				best = run
+			}
+			start = -1
+		}
+	}
+	return best
+}
+
+func isHexDigit(value byte) bool {
+	return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')
 }
 
 func containsAny(value string, needles ...string) bool {
@@ -568,22 +694,4 @@ func containsAny(value string, needles ...string) bool {
 		}
 	}
 	return false
-}
-
-func commandKey(value string) string {
-	value = strings.Join(strings.Fields(value), " ")
-	if len(value) > 180 {
-		value = value[:180]
-	}
-	return value
-}
-
-func confidenceFor(category string, current event) float64 {
-	if category == "unknown" {
-		return 0.35
-	}
-	if current.Key != "" {
-		return 0.9
-	}
-	return 0.72
 }
