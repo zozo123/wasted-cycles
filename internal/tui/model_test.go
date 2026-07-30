@@ -108,7 +108,7 @@ func TestTruncateIsRuneSafe(t *testing.T) {
 
 func TestPlainSummary(t *testing.T) {
 	output := Plain(analyze.DemoReport())
-	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "RUNS", "turn resolution", "cursor"} {
+	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "RUNS", "turn resolution", "cursor", "IF FIXED", "Illustrative only"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("plain output is missing %q:\n%s", want, output)
 		}

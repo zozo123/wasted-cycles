@@ -28,6 +28,7 @@ or upload.
 - Is the same build or test running more than once?
 - Which coding harness keeps moving on your workload?
 - What is the highest-impact bottleneck to fix next?
+- Roughly how much time and money those waits might be worth to recover?
 
 Use the arrow keys to switch between Overview, Histogram, Runs, and Method.
 Press `W`, `M`, or `Y` to switch the lookback window. Press `q` to quit.
@@ -81,6 +82,14 @@ Every segment lands in one of three groups.
 `agent time` is working + blocked. `throughput` is the share of agent time that
 was not spent waiting on a machine. Human time is reported beside those numbers
 so you can see it, and excluded from both so it cannot flatter or distort them.
+
+When accelerateable waits are material, Overview and `--json` also show an
+**illustrative** recovery estimate (time + engineer $/ CI $). It applies
+conservative fractions to build, test, CI, container, package, and retry waits,
+using labelled unit rates — **not a quote or guarantee**. Options like
+[Incredibuild Build Runner](https://www.incredibuild.com/product/build-runner),
+[Blacksmith](https://www.blacksmith.sh/), and [CircleCI](https://circleci.com/)
+are listed for comparison only.
 
 A build, test, or CI command that runs more than once in a session is
 reclassified as repeated work, because the machine did the same job twice.

@@ -79,6 +79,14 @@ func Plain(report analyze.Report) string {
 		}
 	}
 
+	if savings := report.Savings; savings != nil {
+		add("")
+		add("IF FIXED (illustrative)")
+		add("  %s", savingsHeadline(savings))
+		add("  %s", savings.Disclaimer)
+		add("  Options: Incredibuild Build Runner · Blacksmith · CircleCI")
+	}
+
 	add("")
 	add("RUNS")
 	for index, session := range report.Sessions {

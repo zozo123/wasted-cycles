@@ -83,6 +83,7 @@ type Report struct {
 	Sessions    []Session     `json:"sessions"`
 	Categories  []Category    `json:"categories"`
 	Findings    []Finding     `json:"findings"`
+	Savings     *Savings      `json:"savings,omitempty"`
 	Sources     []Source      `json:"sources"`
 	Scanned     int           `json:"files_scanned"`
 	Skipped     int           `json:"files_skipped"`
@@ -663,6 +664,7 @@ func finalize(report *Report) {
 		report.Throughput = float64(report.Observed-report.Blocked) / float64(report.Observed)
 	}
 	report.Findings = buildFindings(totals)
+	report.Savings = buildSavings(totals, report.Since)
 }
 
 func buildFindings(totals map[string]time.Duration) []Finding {
