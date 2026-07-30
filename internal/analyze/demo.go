@@ -32,7 +32,7 @@ func DemoReport() Report {
 			{"human_wait", "handoff to human", 17 * time.Minute},
 			{"reasoning", "model response", 16 * time.Minute},
 		}},
-		{"claude-44de", "claude", "admin-console", []demoSegment{
+		{"cursor-3e91", "cursor", "admin-console", []demoSegment{
 			{"reasoning", "model response", 13 * time.Minute},
 			{"explore", "read / search", 9 * time.Minute},
 			{"edit", "code change", 19 * time.Minute},
@@ -47,11 +47,11 @@ func DemoReport() Report {
 		}},
 	}
 
-	report := Report{GeneratedAt: now, Since: now.Add(-7 * 24 * time.Hour), IsDemo: true}
+	report := Report{GeneratedAt: now, Since: Window7d.Since(now), Window: Window7d, IsDemo: true}
 	cursor := now.Add(-5 * time.Hour)
 	for _, row := range rows {
 		resolution := resolutionEvent
-		if row.provider == "grok" {
+		if row.provider == "grok" || row.provider == "cursor" {
 			resolution = resolutionTurn
 		}
 		session := Session{ID: row.id, Provider: row.provider, Project: row.project, Start: cursor, Resolution: resolution}
@@ -76,7 +76,7 @@ func DemoReport() Report {
 		report.Sessions = append(report.Sessions, session)
 		cursor = cursor.Add(9 * time.Minute)
 	}
-	report.Sources = []Source{{"claude", 2}, {"codex", 1}, {"grok", 1}}
+	report.Sources = []Source{{"claude", 1}, {"codex", 1}, {"cursor", 1}, {"grok", 1}}
 	report.Scanned = 4
 	finalize(&report)
 	return report

@@ -30,7 +30,7 @@ or upload.
 - What is the highest-impact bottleneck to fix next?
 
 Use the arrow keys to switch between Overview, Histogram, Runs, and Method.
-Press `q` to quit.
+Press `7`, `0`, or `y` to switch the lookback window. Press `q` to quit.
 
 ```sh
 # Explore with a realistic built-in dataset
@@ -41,6 +41,10 @@ curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
   sh -s -- --days 30
 
+# Year to date
+curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
+  sh -s -- --ytd
+
 # Machine-readable output
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
   sh -s -- --json
@@ -49,11 +53,15 @@ curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
 | Flag | Meaning |
 | --- | --- |
 | `--days N` | Days of history to scan (default 7, max 365) |
+| `--ytd` | Scan from January 1 of this year |
 | `--demo` | Open the built-in demo dataset instead of your traces |
 | `--json` | Print the full report as JSON |
 | `--plain` | Print a plain-text summary instead of the TUI |
 | `--no-alt-screen` | Render without the terminal alternate screen |
 | `--version` | Print the version |
+
+In the TUI, press `7`, `0`, or `y` (or `[` / `]`) to switch between **7d**, **30d**,
+and **YTD** without restarting. The header chips show the active window.
 
 The TUI is used when stdout is a terminal. Piped or redirected output falls
 back to the plain-text summary automatically, so `wasted-cycles > report.txt`
@@ -82,17 +90,16 @@ reclassified as repeated work, because the machine did the same job twice.
 | --- | --- | --- |
 | Codex | `~/.codex/sessions` | per event |
 | Claude Code | `~/.claude/projects` | per event |
+| Cursor | `~/.cursor/projects/*/agent-transcripts` | per turn |
 | Grok Build | `~/.grok/sessions` | per session |
 
 Wasted Cycles reads JSONL trace files modified within the selected period.
 Prompt text and source code are never stored or rendered.
 
-**Cursor is not supported.** Its transcripts carry no per-event timestamps, only
-a wall-clock marker on each user turn. Reconstructing time from those markers
-cannot separate work from idling: on a real corpus it reported a scheduled agent
-that ticked every 30 minutes for 5 days as 120 hours of continuous work. A
-number that wrong is worse than no number, so Cursor traces are skipped until
-the harness records event times.
+Cursor transcripts only stamp wall-clock time on user turns, so each segment
+spans a whole turn rather than a single tool call. Scheduled Cursor agents that
+tick on a fixed interval (the pattern that once inflated a session to 120 hours)
+are detected and dropped.
 
 ## Method
 

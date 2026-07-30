@@ -123,18 +123,18 @@ func mapOf(value any) map[string]any {
 var (
 	exploreTools = set(
 		"read", "read_file", "readfile", "view", "view_file", "view_image", "open", "cat",
-		"glob", "grep", "search", "ripgrep", "file_search", "codebase_search", "semantic_search",
-		"ls", "list_dir", "listdirectory", "find", "notebookread", "toolsearch",
+		"glob", "grep", "rg", "search", "ripgrep", "file_search", "codebase_search", "semantic_search",
+		"ls", "list_dir", "listdirectory", "find", "notebookread", "toolsearch", "readlints",
 		"websearch", "web_search", "webfetch", "web_fetch", "fetch", "browse",
 	)
 	editTools = set(
 		"edit", "edit_file", "editfile", "write", "write_file", "writefile", "create_file",
 		"multiedit", "notebookedit", "str_replace", "strreplace", "string_replace",
-		"search_replace", "apply_patch", "applypatch", "patch", "delete_file", "rename_file",
+		"search_replace", "apply_patch", "applypatch", "patch", "delete", "delete_file", "rename_file",
 	)
 	shellTools = set(
 		"bash", "shell", "exec", "exec_command", "execcommand", "run", "run_command",
-		"run_terminal_cmd", "terminal", "local_shell", "awaitshell", "await_shell",
+		"run_terminal_cmd", "terminal", "local_shell", "await", "awaitshell", "await_shell",
 		"process", "python", "node", "js", "script",
 	)
 	agentTools = set(
@@ -142,8 +142,8 @@ var (
 		"followup_task", "dispatch_agent", "send_message", "sendmessage", "workflow",
 	)
 	planTools = set(
-		"todowrite", "update_plan", "updateplan", "taskcreate", "taskupdate", "tasklist",
-		"taskget", "exitplanmode", "enterplanmode", "structuredoutput", "askuserquestion",
+		"todowrite", "update_plan", "updateplan", "createplan", "taskcreate", "taskupdate", "tasklist",
+		"taskget", "exitplanmode", "enterplanmode", "structuredoutput", "askuserquestion", "askquestion",
 	)
 )
 

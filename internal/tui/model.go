@@ -42,10 +42,47 @@ type Model struct {
 	width   int
 	height  int
 	tab     int
+	window  analyze.Window
+	demo    bool
+	loading bool
+	scanErr error
+	gen     int
+	scan    func(analyze.Window) (analyze.Report, error)
 }
 
-func New(report analyze.Report, version string) Model {
-	return Model{report: report, version: version, width: 100, height: 30}
+// Config wires the TUI to a named lookback window and an optional custom scanner
+// (tests inject a fake; production leaves Scan nil and hits the local traces).
+type Config struct {
+	Window analyze.Window
+	Demo   bool
+	Scan   func(analyze.Window) (analyze.Report, error)
+}
+
+type scannedMsg struct {
+	gen    int
+	window analyze.Window
+	report analyze.Report
+	err    error
+}
+
+func New(report analyze.Report, version string, cfg Config) Model {
+	window := cfg.Window
+	if !window.Valid() {
+		if report.Window.Valid() {
+			window = report.Window
+		} else {
+			window = analyze.Window7d
+		}
+	}
+	return Model{
+		report:  report,
+		version: version,
+		width:   100,
+		height:  30,
+		window:  window,
+		demo:    cfg.Demo || report.IsDemo,
+		scan:    cfg.Scan,
+	}
 }
 
 func (m Model) Init() tea.Cmd { return nil }
@@ -54,6 +91,18 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+	case scannedMsg:
+		if msg.gen != m.gen {
+			return m, nil
+		}
+		m.loading = false
+		m.window = msg.window
+		if msg.err != nil {
+			m.scanErr = msg.err
+			return m, nil
+		}
+		m.scanErr = nil
+		m.report = msg.report
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
@@ -70,9 +119,54 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.tab = tabRuns
 		case "4":
 			m.tab = tabMethod
+		case "7":
+			return m.setWindow(analyze.Window7d)
+		case "0":
+			return m.setWindow(analyze.Window30d)
+		case "y":
+			return m.setWindow(analyze.WindowYTD)
+		case "]":
+			return m.setWindow(m.window.Next())
+		case "[":
+			return m.setWindow(m.window.Prev())
 		}
 	}
 	return m, nil
+}
+
+func (m Model) setWindow(window analyze.Window) (tea.Model, tea.Cmd) {
+	if !window.Valid() || window == m.window && !m.loading {
+		return m, nil
+	}
+	m.window = window
+	m.loading = true
+	m.scanErr = nil
+	m.gen++
+	gen := m.gen
+	scan := m.scan
+	demo := m.demo
+	return m, func() tea.Msg {
+		if scan != nil {
+			report, err := scan(window)
+			return scannedMsg{gen: gen, window: window, report: report, err: err}
+		}
+		if demo {
+			report := analyze.DemoReport()
+			report.Window = window
+			report.Since = window.Since(time.Now())
+			return scannedMsg{gen: gen, window: window, report: report}
+		}
+		report, err := defaultScan(window)
+		return scannedMsg{gen: gen, window: window, report: report, err: err}
+	}
+}
+
+func defaultScan(window analyze.Window) (analyze.Report, error) {
+	return analyze.Run(analyze.Options{
+		Since:  window.Since(time.Now()),
+		Window: window,
+		MaxGap: 30 * time.Minute,
+	})
 }
 
 func (m Model) View() string {
@@ -90,18 +184,19 @@ func (m Model) View() string {
 	default:
 		content = m.overview(body)
 	}
-	page := lipgloss.JoinVertical(lipgloss.Left, m.header(body), content, m.footer(body))
+	parts := []string{m.header(body)}
+	if banner := m.statusBanner(body); banner != "" {
+		parts = append(parts, banner)
+	}
+	parts = append(parts, content, m.footer(body))
+	page := lipgloss.JoinVertical(lipgloss.Left, parts...)
 	return lipgloss.NewStyle().MarginLeft(2).MarginTop(1).Render(page)
 }
 
 func (m Model) header(width int) string {
 	mark := lipgloss.NewStyle().Bold(true).Foreground(brand).Render("WASTED") +
 		lipgloss.NewStyle().Bold(true).Foreground(ink).Render(" CYCLES")
-	scope := fmt.Sprintf("last %s · %d traces", relativePeriod(m.report.Since), m.report.Scanned)
-	if m.report.IsDemo {
-		scope = "demo dataset"
-	}
-	top := spread(mark, lipgloss.NewStyle().Foreground(muted).Render(scope), width)
+	top := spread(mark, m.rangeChips(), width)
 
 	var tabs []string
 	for index, label := range []string{"1 OVERVIEW", "2 HISTOGRAM", "3 RUNS", "4 METHOD"} {
@@ -111,13 +206,49 @@ func (m Model) header(width int) string {
 		}
 		tabs = append(tabs, style.Render(label))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, top, "", truncate(strings.Join(tabs, ""), width))
+	meta := m.scopeMeta()
+	tabLine := truncate(strings.Join(tabs, ""), width)
+	if meta != "" && lipgloss.Width(tabLine)+1+lipgloss.Width(meta) <= width {
+		tabLine = spread(tabLine, meta, width)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, top, "", tabLine)
+}
+
+func (m Model) rangeChips() string {
+	var chips []string
+	for _, window := range analyze.Windows {
+		label := " " + window.Label() + " "
+		style := lipgloss.NewStyle().Foreground(muted)
+		if window == m.window {
+			style = style.Foreground(ink).Bold(true).Background(faint)
+		}
+		chips = append(chips, style.Render(label))
+	}
+	return strings.Join(chips, " ")
+}
+
+func (m Model) scopeMeta() string {
+	if m.demo {
+		return lipgloss.NewStyle().Foreground(muted).Render("demo dataset")
+	}
+	return lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf("%d traces", m.report.Scanned))
+}
+
+func (m Model) statusBanner(width int) string {
+	switch {
+	case m.loading:
+		return lipgloss.NewStyle().Foreground(brand).Render(truncate("rescanning Codex · Claude · Cursor · Grok…", width))
+	case m.scanErr != nil:
+		return lipgloss.NewStyle().Foreground(blocked).Render(truncate("scan failed: "+m.scanErr.Error(), width))
+	default:
+		return ""
+	}
 }
 
 func (m Model) footer(width int) string {
-	left, right := "←/→ view   1–4 jump   q quit", "local only · no uploads"
+	left, right := "←/→ view   7/0/y range   q quit", "local only · no uploads"
 	if lipgloss.Width(left)+lipgloss.Width(right)+1 > width {
-		left, right = "←/→ · q quit", "local only"
+		left, right = "←/→ · 7/0/y · q", "local only"
 	}
 	return lipgloss.NewStyle().Foreground(muted).Render(spread(left, right, width))
 }
@@ -399,8 +530,9 @@ func (m Model) method(width int) string {
 		{"A wasted cycle", "Time blocked on a machine you do not control: builds, tests, CI, containers, packages, sub-agents. A repeat counts twice — the machine did the work twice.", blocked},
 		{"Not counted", "Waiting on a person. Reported beside the metric, never inside it.", outside},
 		{"Gaps", "Over 2h is a session break and is dropped. Shorter gaps are capped at 30m and marked clamped. " + inferredNote(m.report), ink},
-		{"Soft edges", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Per-segment confidence is in --json.", ink},
+		{"Soft edges", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Cursor and Grok only stamp turns, so a segment spans a whole turn. Scheduled Cursor agents that tick on a fixed interval are dropped. Per-segment confidence is in --json.", ink},
 		{"Detected", sources, ink},
+		{"Window", fmt.Sprintf("%s from %s. Press 7 / 0 / y or [ ] to rescan.", m.window.Label(), m.report.Since.Local().Format("2006-01-02")), ink},
 	}
 
 	lines := []string{heading("METHOD & LIMITS", "use the number, know its edges"), ""}
@@ -427,7 +559,7 @@ func (m Model) empty(width int) string {
 		lipgloss.NewStyle().Foreground(muted).Render(wrap(
 			"Looked in ~/.codex/sessions, ~/.claude/projects, ~/.cursor/projects and ~/.grok/sessions.", width-4)),
 		"",
-		lipgloss.NewStyle().Foreground(ink).Render("Widen the window:") + lipgloss.NewStyle().Foreground(working).Render("  wasted-cycles --days 30"),
+		lipgloss.NewStyle().Foreground(ink).Render("Widen the window:") + lipgloss.NewStyle().Foreground(working).Render("  press 0 (30d) or y (YTD)"),
 		lipgloss.NewStyle().Foreground(ink).Render("See the interface:") + lipgloss.NewStyle().Foreground(working).Render("  wasted-cycles --demo"),
 	}, "\n"))
 }
@@ -503,6 +635,13 @@ func relativePeriod(since time.Time) string {
 		return fmt.Sprintf("%dd", days)
 	}
 	return "24h"
+}
+
+func windowLabel(report analyze.Report) string {
+	if report.Window.Valid() {
+		return report.Window.Label()
+	}
+	return "last " + relativePeriod(report.Since)
 }
 
 func truncate(value string, width int) string {

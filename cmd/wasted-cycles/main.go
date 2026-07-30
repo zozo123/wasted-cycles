@@ -18,7 +18,8 @@ var version = "dev"
 
 func main() {
 	var (
-		days    = flag.Int("days", 7, "number of recent days to analyze")
+		days    = flag.Int("days", 7, "number of recent days to analyze (overridden by --ytd)")
+		ytd     = flag.Bool("ytd", false, "analyze from January 1 of this year")
 		demo    = flag.Bool("demo", false, "open the TUI with a realistic demo report")
 		asJSON  = flag.Bool("json", false, "print the report as JSON")
 		plain   = flag.Bool("plain", false, "print a plain-text summary instead of the TUI")
@@ -36,15 +37,20 @@ func main() {
 		os.Exit(2)
 	}
 
+	now := time.Now()
+	window, since := resolveWindow(*ytd, *days, now)
+
 	var report analyze.Report
 	var err error
 	if *demo {
 		report = analyze.DemoReport()
+		report.Window = window
+		report.Since = since
 	} else {
 		report, err = analyze.Run(analyze.Options{
-			Since:    time.Now().Add(-time.Duration(*days) * 24 * time.Hour),
-			MaxGap:   30 * time.Minute,
-			MaxFiles: 600,
+			Since:  since,
+			Window: window,
+			MaxGap: 30 * time.Minute,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "wasted-cycles: %v\n", err)
@@ -71,8 +77,27 @@ func main() {
 	if !*noAlt {
 		programOptions = append(programOptions, tea.WithAltScreen())
 	}
-	if _, err := tea.NewProgram(tui.New(report, version), programOptions...).Run(); err != nil {
+	model := tui.New(report, version, tui.Config{
+		Window: window,
+		Demo:   *demo,
+	})
+	if _, err := tea.NewProgram(model, programOptions...).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "wasted-cycles: interactive terminal unavailable, falling back to plain output")
 		fmt.Println(tui.Plain(report))
+	}
+}
+
+func resolveWindow(ytd bool, days int, now time.Time) (analyze.Window, time.Time) {
+	switch {
+	case ytd:
+		return analyze.WindowYTD, analyze.WindowYTD.Since(now)
+	case days == 7:
+		return analyze.Window7d, analyze.Window7d.Since(now)
+	case days == 30:
+		return analyze.Window30d, analyze.Window30d.Since(now)
+	default:
+		// Custom --days keeps an exact lookback; the nearest chip is only a hint
+		// until the user presses 7 / 0 / y and snaps to a named window.
+		return analyze.WindowFromDays(days, now), now.Add(-time.Duration(days) * 24 * time.Hour)
 	}
 }
