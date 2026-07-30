@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wasted Cycles — wall-clock profiler for coding-agent runs</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%230D0F0C'/%3E%3Crect%20x='2'%20y='9'%20width='3'%20height='5'%20fill='%23C8F56A'/%3E%3Crect%20x='6.5'%20y='5'%20width='3'%20height='9'%20fill='%23B197FC'/%3E%3Crect%20x='11'%20y='2'%20width='3'%20height='12'%20fill='%23FF6B35'/%3E%3C/svg%3E">
+<meta name="description" content="Wasted Cycles is a local terminal profiler that reads the Codex, Claude Code, Cursor, and Grok Build traces already on your machine and shows where a run stopped coding: model work, reads, edits, verify, CI waits, human handoffs, and retries.">
+<style>
+  :root {
+    color-scheme: dark;
+    --ink: #F3F2ED;
+    --muted: #858780;
+    --faint: #353833;
+    --panel: #171916;
+    --bg: #0D0F0C;
+    --orange: #FF6B35;
+    --lime: #C8F56A;
+    --blue: #61A8FF;
+    --purple: #B197FC;
+    --yellow: #FFD166;
+    --red: #FF5D73;
+    --teal: #57D7C4;
+    --dependency: #C084FC;
+    --retry: #FB7185;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    overflow-x: hidden;
+    overflow-wrap: break-word;
+  }
+
+  main {
+    max-width: 62rem;
+    margin: 0 auto;
+    padding: 3.5rem 1.25rem 4rem;
+  }
+
+  section { margin-top: 3.25rem; }
+
+  h1, h2, h3 { line-height: 1.25; font-weight: 600; }
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 1.25rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--faint);
+  }
+
+  h3 { font-size: 1rem; margin: 0 0 0.35rem; }
+
+  p { margin: 0 0 1rem; }
+
+  a { color: var(--blue); }
+  a:hover { color: var(--teal); }
+
+  code, pre, .mono { font-family: var(--mono); }
+
+  .note { color: var(--muted); font-size: 0.9375rem; }
+
+  /* ---------- header ---------- */
+
+  .wordmark {
+    font-family: var(--mono);
+    font-size: clamp(1.75rem, 8vw, 3.25rem);
+    letter-spacing: 0.08em;
+    margin: 0;
+    font-weight: 700;
+  }
+
+  .wordmark .wasted { color: var(--orange); }
+  .wordmark .cycles { color: var(--ink); }
+
+  .tagline {
+    font-size: clamp(1.0625rem, 3.5vw, 1.375rem);
+    color: var(--ink);
+    margin: 0.85rem 0 0;
+  }
+
+  .kicker {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 0.9rem;
+  }
+
+  .lede { color: var(--muted); max-width: 46rem; margin-top: 1rem; }
+
+  /* ---------- install ---------- */
+
+  .install { margin-top: 2.25rem; }
+
+  .cmd-wrap {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--faint);
+    border-radius: 6px;
+  }
+
+  pre {
+    margin: 0;
+    padding: 1rem 1rem;
+    overflow-x: auto;
+    font-size: 0.875rem;
+    line-height: 1.7;
+    color: var(--ink);
+  }
+
+  pre .prompt { color: var(--lime); user-select: none; }
+
+  .copy {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    background: #21241f;
+    color: #B7B9B0;
+    border: 1px solid var(--faint);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 0.3rem 0.55rem;
+    cursor: pointer;
+  }
+
+  .copy:hover { color: var(--ink); border-color: var(--muted); }
+
+  .install .note { margin-top: 0.75rem; }
+
+  /* ---------- lists ---------- */
+
+  ul.answers { list-style: none; margin: 0; padding: 0; }
+
+  ul.answers li {
+    padding: 0.55rem 0 0.55rem 1.5rem;
+    position: relative;
+    border-bottom: 1px solid var(--faint);
+  }
+
+  ul.answers li:last-child { border-bottom: 0; }
+
+  ul.answers li::before {
+    content: "?";
+    position: absolute;
+    left: 0;
+    color: var(--purple);
+    font-family: var(--mono);
+    font-weight: 700;
+  }
+
+  /* ---------- histogram ---------- */
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--faint);
+    border-radius: 6px;
+    padding: 1.25rem 1rem;
+  }
+
+  .panel-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.75rem;
+    align-items: baseline;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 1.1rem;
+  }
+
+  .panel-head .t { color: var(--ink); font-weight: 700; }
+  .panel-head .s { color: var(--muted); letter-spacing: 0.04em; text-transform: none; }
+
+  .demo-badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--yellow);
+    border: 1px solid var(--yellow);
+    border-radius: 4px;
+    padding: 0.15rem 0.45rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .hist { font-family: var(--mono); font-size: 0.8125rem; }
+
+  .row {
+    display: grid;
+    grid-template-columns: 11.5rem minmax(0, 1fr) 5.5rem;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.22rem 0;
+  }
+
+  .row .label { color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .track {
+    display: block;
+    background: repeating-linear-gradient(
+      to right,
+      var(--faint) 0 3px,
+      transparent 3px 5px
+    );
+    height: 0.85rem;
+    border-radius: 2px;
+    min-width: 0;
+  }
+
+  .fill { display: block; height: 100%; border-radius: 2px; background: var(--c); }
+
+  .row .value { text-align: right; font-weight: 700; color: var(--c, var(--ink)); white-space: nowrap; }
+  .row .pct { color: var(--muted); font-weight: 400; }
+
+  .total {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    color: var(--muted);
+    border-top: 1px solid var(--faint);
+    margin-top: 1rem;
+    padding-top: 0.85rem;
+  }
+
+  .total b { color: var(--ink); }
+
+  .hist-foot {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.85rem;
+  }
+
+  /* ---------- table ---------- */
+
+  .table-wrap { overflow-x: auto; border: 1px solid var(--faint); border-radius: 6px; }
+
+  table { border-collapse: collapse; width: 100%; min-width: 22rem; background: var(--panel); }
+
+  th, td { text-align: left; padding: 0.65rem 1rem; border-bottom: 1px solid var(--faint); }
+
+  tr:last-child td { border-bottom: 0; }
+
+  th {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 600;
+  }
+
+  td.src { font-family: var(--mono); font-size: 0.8125rem; color: var(--teal); white-space: nowrap; }
+
+  /* ---------- method ---------- */
+
+  .method p { max-width: 46rem; }
+  .method .privacy { color: var(--lime); }
+
+  .flags { display: grid; gap: 0.65rem; }
+
+  .flag {
+    display: grid;
+    grid-template-columns: 7.5rem minmax(0, 1fr);
+    gap: 0.35rem 1rem;
+    align-items: baseline;
+    border-bottom: 1px solid var(--faint);
+    padding-bottom: 0.65rem;
+  }
+
+  .flag:last-child { border-bottom: 0; }
+  .flag code { color: var(--lime); font-size: 0.875rem; }
+  .flag span { color: var(--muted); }
+
+  /* ---------- footer ---------- */
+
+  footer {
+    margin-top: 3.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--faint);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+    justify-content: space-between;
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    color: var(--muted);
+  }
+
+  /* Below ~50rem the install command is wider than the box, so an overlaid
+     button would permanently cover part of it. Stack it instead. */
+  @media (max-width: 50rem) {
+    .cmd-wrap { display: flex; flex-direction: column; }
+    .cmd-wrap > pre { min-width: 0; }
+    .copy {
+      position: static;
+      align-self: flex-end;
+      margin: 0.5rem 0.5rem 0;
+    }
+  }
+
+  @media (max-width: 34rem) {
+    main { padding-top: 2.5rem; }
+    .row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas: "label value" "track track";
+      row-gap: 0.2rem;
+      padding: 0.4rem 0;
+    }
+    .row .label { grid-area: label; }
+    .row .value { grid-area: value; }
+    .track { grid-area: track; }
+    .flag { grid-template-columns: minmax(0, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main>
+
+  <header>
+    <p class="kicker">Local wall-clock profiler</p>
+    <h1 class="wordmark"><span class="wasted">WASTED</span> <span class="cycles">CYCLES</span></h1>
+    <p class="tagline">Find where coding-agent runs stop coding.</p>
+    <p class="lede">
+      Wasted Cycles reads the Codex, Claude Code, Cursor Agent, and Grok Build traces already
+      on your machine and turns them into an interactive terminal histogram: model work, reads,
+      edits, verify runs, CI waits, human handoffs, agent joins, network stalls, and retries.
+    </p>
+  </header>
+
+  <div class="install">
+    <div class="cmd-wrap">
+      <button class="copy" type="button" id="copy-install">Copy</button>
+<pre id="install-cmd"><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh</pre>
+    </div>
+    <p class="note">
+      No install, no account, no daemon, no API key, no upload. The runner downloads a
+      checksum-verified binary into a temporary directory, runs it, and deletes it on exit.
+    </p>
+  </div>
+
+  <section>
+    <h2>What it answers</h2>
+    <ul class="answers">
+      <li>What share of elapsed time was actual model reasoning?</li>
+      <li>Which waits dominate the critical path?</li>
+      <li>Are retries, CI, humans, or sub-agents limiting throughput?</li>
+      <li>Which coding harness stays productive for your workload?</li>
+      <li>What is the highest-impact bottleneck to fix next?</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>What the output looks like</h2>
+    <p class="demo-badge">Built-in demo dataset — not a real measurement</p>
+    <p class="note">
+      Every number below comes from the synthetic dataset shipped with
+      <code>--demo</code>, reproduced here in HTML. It exists to show the shape of the
+      report, not to make a claim about any harness. Run the profiler on your own traces
+      to get real figures.
+    </p>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="t">Where the time went</span>
+        <span class="s">4 demo runs · last 7 days</span>
+      </div>
+
+      <div class="hist">
+        <div class="row" style="--c: var(--purple)">
+          <span class="label">Model work</span>
+          <span class="track"><span class="fill" style="width: 91.4%"></span></span>
+          <span class="value">1h 04m <span class="pct">23%</span></span>
+        </div>
+        <div class="row" style="--c: var(--blue)">
+          <span class="label">Read &amp; search</span>
+          <span class="track"><span class="fill" style="width: 48.6%"></span></span>
+          <span class="value">34m <span class="pct">12%</span></span>
+        </div>
+        <div class="row" style="--c: var(--lime)">
+          <span class="label">Code changes</span>
+          <span class="track"><span class="fill" style="width: 100%"></span></span>
+          <span class="value">1h 10m <span class="pct">25%</span></span>
+        </div>
+        <div class="row" style="--c: var(--teal)">
+          <span class="label">Local verify</span>
+          <span class="track"><span class="fill" style="width: 57.1%"></span></span>
+          <span class="value">40m <span class="pct">14%</span></span>
+        </div>
+        <div class="row" style="--c: var(--muted)">
+          <span class="label">Other tool work</span>
+          <span class="track"><span class="fill" style="width: 8.6%"></span></span>
+          <span class="value">6m <span class="pct">2%</span></span>
+        </div>
+        <div class="row" style="--c: var(--orange)">
+          <span class="label">Waiting for CI</span>
+          <span class="track"><span class="fill" style="width: 34.3%"></span></span>
+          <span class="value">24m <span class="pct">9%</span></span>
+        </div>
+        <div class="row" style="--c: var(--yellow)">
+          <span class="label">Waiting for agents</span>
+          <span class="track"><span class="fill" style="width: 17.1%"></span></span>
+          <span class="value">12m <span class="pct">4%</span></span>
+        </div>
+        <div class="row" style="--c: var(--red)">
+          <span class="label">Waiting for human</span>
+          <span class="track"><span class="fill" style="width: 24.3%"></span></span>
+          <span class="value">17m <span class="pct">6%</span></span>
+        </div>
+        <div class="row" style="--c: var(--dependency)">
+          <span class="label">Tool / network wait</span>
+          <span class="track"><span class="fill" style="width: 10%"></span></span>
+          <span class="value">7m <span class="pct">2%</span></span>
+        </div>
+        <div class="row" style="--c: var(--retry)">
+          <span class="label">Retries</span>
+          <span class="track"><span class="fill" style="width: 11.4%"></span></span>
+          <span class="value">8m <span class="pct">3%</span></span>
+        </div>
+      </div>
+
+      <div class="total">
+        <span>Observed elapsed time</span>
+        <span><b>4h 42m</b></span>
+      </div>
+
+      <p class="hist-foot">
+        Time between timestamped trace events · idle gaps capped at 30m
+      </p>
+    </div>
+
+    <p class="note" style="margin-top: 1rem;">
+      In the terminal the same data is a live TUI: arrow keys switch between Overview,
+      Histogram, Runs, and Method; <code>q</code> quits.
+    </p>
+  </section>
+
+  <section>
+    <h2>Supported trace roots</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th scope="col">Harness</th><th scope="col">Local source</th><th scope="col">Resolution</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Codex</td><td class="src">~/.codex/sessions</td><td>per event</td></tr>
+          <tr><td>Claude Code</td><td class="src">~/.claude/projects</td><td>per event</td></tr>
+          <tr><td>Cursor Agent</td><td class="src">~/.cursor/projects</td><td>per turn</td></tr>
+          <tr><td>Grok Build</td><td class="src">~/.grok/sessions</td><td>per turn</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note" style="margin-top: 0.85rem;">
+      JSONL trace files modified inside the selected window are read in place. Nothing is
+      written back, and nothing leaves the machine.
+    </p>
+  </section>
+
+  <section class="method">
+    <h2>Method &amp; limits</h2>
+    <p>
+      The profiler reconstructs elapsed segments between timestamped trace events and
+      classifies each segment by the structured action that opened it: the tool that was
+      called, the command that tool ran, or the message that ended a turn. It reads parsed
+      event structure rather than matching text, so a pasted log or a quoted command in a
+      prompt cannot be mistaken for real activity. It measures wall-clock time, not tokens
+      and not cost.
+    </p>
+    <p>
+      A verification or CI command that repeats is reclassified as retry time, so a test
+      loop shows up as a loop rather than as more verification.
+    </p>
+    <p>
+      Harnesses record different things. Codex and Claude Code stamp individual events.
+      Cursor transcripts carry no per-event timestamps, so its runs are reconstructed per
+      user turn and each turn takes the dominant tool category observed inside it; those
+      runs are marked <code>turn</code> on the Runs screen and carry low confidence. Grok Build
+      records only a session start and end, so a Grok run collapses to a single coarse block
+      and is marked <code>turn</code> too. Records the profiler cannot identify are skipped
+      instead of guessed.
+    </p>
+    <p>
+      Idle time uses two thresholds, because a wait and a walk-away are not the same thing.
+      A gap longer than <strong>2 hours</strong> is a session break and is not counted at
+      all, so closing the laptop overnight cannot show up as &ldquo;waiting for human&rdquo;.
+      A shorter gap is capped at 30 minutes, and those segments are marked
+      <code>clamped</code> with low confidence. The clamped share of the report is stated
+      on the Method screen and emitted as <code>inferred_ns</code>, so measured time and
+      inferred time stay distinguishable.
+    </p>
+    <p>
+      <strong>&ldquo;Model work&rdquo; is an inference proxy</strong>, not measured GPU compute
+      time. It is the interval after a user message or a tool result and before the next
+      emitted action. Harnesses expose different levels of timing detail; unless a trace
+      records an exact duration, that interval is an upper bound on real inference. The
+      Method screen in the TUI states this outright, and <code>--json</code> emits a
+      per-segment <code>confidence</code> score so you can weigh each classification
+      yourself.
+    </p>
+    <p class="privacy">
+      Prompt text and source code are never stored, rendered, or uploaded. Only timestamps,
+      event kinds, and coarse labels are used.
+    </p>
+  </section>
+
+  <section>
+    <h2>Flags</h2>
+    <div class="flags">
+      <div class="flag"><code>--demo</code><span>Open the TUI with the built-in synthetic dataset — no traces required.</span></div>
+      <div class="flag"><code>--days N</code><span>Size of the window to scan, in days. Defaults to 7.</span></div>
+      <div class="flag"><code>--json</code><span>Print the report as JSON instead of opening the TUI.</span></div>
+      <div class="flag"><code>--plain</code><span>Print a plain-text summary instead of the TUI. Used automatically when output is piped or redirected.</span></div>
+      <div class="flag"><code>--no-alt-screen</code><span>Render without the terminal alternate screen.</span></div>
+      <div class="flag"><code>--version</code><span>Print the version and exit.</span></div>
+    </div>
+    <div class="cmd-wrap" style="margin-top: 1.25rem;">
+<pre><span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --demo
+<span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --days 30
+<span class="prompt">$</span> curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh -s -- --json</pre>
+    </div>
+  </section>
+
+  <footer>
+    <span>MIT licensed</span>
+    <span><a href="https://github.com/zozo123/wasted-cycles">github.com/zozo123/wasted-cycles</a></span>
+  </footer>
+
+</main>
+
+<script>
+  (function () {
+    var button = document.getElementById("copy-install");
+    var block = document.getElementById("install-cmd");
+    if (!button || !block || !navigator.clipboard) {
+      if (button) { button.hidden = true; }
+      return;
+    }
+    button.addEventListener("click", function () {
+      var text = block.textContent.replace(/^\$\s*/, "").trim();
+      navigator.clipboard.writeText(text).then(function () {
+        button.textContent = "Copied";
+        setTimeout(function () { button.textContent = "Copy"; }, 1600);
+      });
+    });
+  })();
+</script>
+
+</body>
+</html>
