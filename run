@@ -34,9 +34,14 @@ case "$arch" in
 esac
 
 if [ "$version" = "latest" ]; then
+  # GitHub's unversioned release redirect can remain cached on the previous
+  # release after the API already reports a new latest tag. A per-run query
+  # keeps `curl | sh` from silently downloading yesterday's binary.
   base="https://github.com/$repo/releases/latest/download"
+  cache_bust="?released=$(date +%s)"
 else
   base="https://github.com/$repo/releases/download/$version"
+  cache_bust=""
 fi
 
 asset="wasted-cycles_${os}_${arch}.tar.gz"
@@ -50,8 +55,8 @@ download() {
   fi
 }
 
-download "$base/$asset" "$tmp_root/$asset"
-download "$base/checksums.txt" "$tmp_root/checksums.txt"
+download "$base/$asset$cache_bust" "$tmp_root/$asset"
+download "$base/checksums.txt$cache_bust" "$tmp_root/checksums.txt"
 
 # Tolerate the '*' binary-mode marker some sha256sum implementations emit.
 expected="$(awk -v file="$asset" '{ sub(/^\*/, "", $2) } $2 == file { print $1 }' "$tmp_root/checksums.txt")"
