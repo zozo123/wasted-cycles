@@ -201,3 +201,5 @@ mod pending_tests {
             ${{ runner.temp }}/zed-shape.json
             ${{ runner.temp }}/probe.json
           if-no-files-found: warn
+
+# Triggered after the default-branch validator was installed.
