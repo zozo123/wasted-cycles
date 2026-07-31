@@ -1,0 +1,203 @@
+name: Cargo observable validation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 1e02d691ba8b99d46a664ca5af7a6bd56e1e44cf
+  QUEUE_SHA: 9c8691d224960d8688e19ef310686c71490cdb05
+  CACHE_SHA: 1e31e24161755c0ce49441ebdc7eb71c833c1a29
+  ZED_SHA: 98f39bfcca6f5c1546232916f307dc062b062f64
+  __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS: nightly
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: zozo123/cargo
+          ref: ${{ env.QUEUE_SHA }}
+          fetch-depth: 0
+          path: cargo-pr
+      - uses: actions/checkout@v4
+        with:
+          repository: zozo123/cargo
+          ref: ${{ env.CACHE_SHA }}
+          path: cargo-cache
+      - uses: actions/checkout@v4
+        with:
+          repository: zed-industries/zed
+          ref: ${{ env.ZED_SHA }}
+          path: zed
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup component add --toolchain 1.97.0 rustfmt clippy
+          rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Complete scheduler heaps
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('cargo-pr/src/compiler/job_queue/mod.rs')
+          source = path.read_text()
+          source = source.replace('use std::cell::RefCell;\n', 'use std::cell::RefCell;\nuse std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n', 1)
+          marker = "pub struct JobQueue<'gctx> {\n    queue: DependencyQueue<Unit, Artifact, Job>,\n    counts: HashMap<PackageId, usize>,\n    timings: Timings<'gctx>,\n}\n\n"
+          pending = r'''struct Pending<T> {
+    value: T,
+    priority: usize,
+}
+impl<T> PartialEq for Pending<T> {
+    fn eq(&self, other: &Self) -> bool { self.priority == other.priority }
+}
+impl<T> Eq for Pending<T> {}
+impl<T> PartialOrd for Pending<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl<T> Ord for Pending<T> {
+    fn cmp(&self, other: &Self) -> Ordering { self.priority.cmp(&other.priority) }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+    use std::collections::BinaryHeap;
+    #[test]
+    fn priority_and_equal_values() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending { value: 1, priority: 1 });
+        queue.push(Pending { value: 2, priority: 3 });
+        queue.push(Pending { value: 3, priority: 1 });
+        assert_eq!(queue.pop().unwrap().value, 2);
+        let mut rest = vec![queue.pop().unwrap().value, queue.pop().unwrap().value];
+        rest.sort_unstable();
+        assert_eq!(rest, vec![1, 3]);
+    }
+}
+
+'''
+          assert marker in source
+          source = source.replace(marker, marker + pending, 1)
+          source = source.replace('    pending_queue: Vec<(Unit, Job, usize)>,\n', '    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,\n', 1)
+          source = source.replace('            pending_queue: Vec::new(),\n', '            pending_queue: BinaryHeap::new(),\n', 1)
+          old = '''            // We want to keep the pieces of work in the `pending_queue` sorted
+            // by their priorities, and insert the current job at its correctly
+            // sorted position: following the lower priority jobs, and the ones
+            // with the same priority (since they were dequeued before the
+            // current one, we also keep that relation).
+            let idx = self
+                .pending_queue
+                .partition_point(|&(_, _, p)| p <= priority);
+            self.pending_queue.insert(idx, (unit, job, priority));
+'''
+          new = '''            self.pending_queue.push(Pending {
+                value: (unit, job),
+                priority,
+            });
+'''
+          assert old in source
+          source = source.replace(old, new, 1)
+          source = source.replace('            let (unit, job, _) = self.pending_queue.pop().unwrap();\n', '''            let Pending { value: (unit, job), .. } = self.pending_queue.pop().unwrap();
+''', 1)
+          path.write_text(source)
+          PY
+          cargo +1.97.0 fmt --manifest-path cargo-pr/Cargo.toml --all
+          git -C cargo-pr diff --check
+          git -C cargo-pr diff > "$RUNNER_TEMP/complete-scheduler.patch"
+
+      - name: Test completed scheduler
+        run: |
+          cargo +1.97.0 test --manifest-path cargo-pr/Cargo.toml --lib util::dependency_queue
+          cargo +1.97.0 test --manifest-path cargo-pr/Cargo.toml --lib compiler::job_queue::pending_tests
+          cargo +1.97.0 clippy --manifest-path cargo-pr/Cargo.toml --lib --tests -- -D warnings
+
+      - name: Build Cargo variants
+        run: |
+          git -C cargo-pr worktree add ../cargo-base "$BASE_SHA"
+          for item in base:cargo-base queue:cargo-pr cache:cargo-cache; do
+            name=${item%%:*}; dir=${item#*:}
+            CARGO_TARGET_DIR="$RUNNER_TEMP/build-$name" cargo +1.97.0 build --release --locked --manifest-path "$dir/Cargo.toml" --bin cargo
+            cp "$RUNNER_TEMP/build-$name/release/cargo" "$RUNNER_TEMP/cargo-$name"
+          done
+
+      - name: Analyze Zed and benchmark probes
+        working-directory: zed
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+          CARGO_TARGET_DIR: ${{ runner.temp }}/zed-target
+        run: |
+          "$RUNNER_TEMP/cargo-base" fetch --locked
+          "$RUNNER_TEMP/cargo-base" check --locked -Z unstable-options --unit-graph -p zed --lib > "$RUNNER_TEMP/zed-unit-graph.json"
+          python3 - <<'PY'
+          import bisect, json, os, shutil, statistics, subprocess, time
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          graph = json.loads((root/'zed-unit-graph.json').read_text())
+          units = graph['units']; count = len(units)
+          deps=[]; reverse=[[] for _ in range(count)]
+          for index, unit in enumerate(units):
+              current={item['index'] for item in unit.get('dependencies', [])}
+              deps.append(current)
+              for dependency in current: reverse[dependency].append(index)
+          memo={}; visiting=set()
+          def closure(node):
+              if node in memo: return memo[node]
+              if node in visiting: raise RuntimeError('cycle')
+              visiting.add(node); result={node}
+              for child in reverse[node]: result |= closure(child)
+              visiting.remove(node); memo[node]=result
+              return result
+          priority=[len(closure(i)) for i in range(count)]
+          remaining=[set(value) for value in deps]; nodes=set(range(count)); ready={i for i,value in enumerate(remaining) if not value}; pending=[]
+          scans=shifts=max_batch=max_pending=0
+          while nodes:
+              batch=list(ready); ready.clear(); max_batch=max(max_batch,len(batch))
+              for node in batch:
+                  scans += len(nodes); nodes.remove(node)
+                  position=bisect.bisect_right([entry[0] for entry in pending], priority[node])
+                  shifts += len(pending)-position; pending.insert(position,(priority[node],node))
+              scans += len(nodes); max_pending=max(max_pending,len(pending))
+              if not pending: raise RuntimeError('stalled')
+              _,done=pending.pop()
+              for child in reverse[done]:
+                  remaining[child].discard(done)
+                  if child in nodes and not remaining[child]: ready.add(child)
+          shape={'units':count,'edges':sum(len(value) for value in deps),'initial_ready':sum(not value for value in deps),'max_ready_batch':max_batch,'max_pending':max_pending,'baseline_scanned_entries':scans,'baseline_shifted_entries':shifts}
+          (root/'zed-shape.json').write_text(json.dumps(shape,indent=2)); print(json.dumps(shape,indent=2))
+
+          results={}
+          for name,binary in {'base':root/'cargo-base','shared':root/'cargo-cache'}.items():
+              home=root/f'home-{name}'; home.mkdir(exist_ok=True)
+              for child in ('registry','git'):
+                  src=Path.home()/'.cargo'/child; dst=home/child
+                  if src.exists() and not dst.exists(): dst.symlink_to(src,target_is_directory=True)
+              def once(index):
+                  target=root/f'probe-{name}-{index}'; shutil.rmtree(target,ignore_errors=True)
+                  env=os.environ.copy(); env['CARGO_HOME']=str(home); env['CARGO_TARGET_DIR']=str(target); env['CARGO_NET_OFFLINE']='true'
+                  started=time.perf_counter_ns()
+                  subprocess.run([str(binary),'check','--locked','--offline','-Z','unstable-options','--unit-graph','-p','zed','--lib'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env)
+                  return (time.perf_counter_ns()-started)/1e6
+              if name=='shared': once('warm')
+              samples=[once(i) for i in range(12)]
+              results[name]={'median_ms':statistics.median(samples),'mean_ms':statistics.mean(samples),'stdev_ms':statistics.stdev(samples),'samples_ms':samples}
+          (root/'probe.json').write_text(json.dumps(results,indent=2)); print(json.dumps(results,indent=2))
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-observable-validation
+          path: |
+            ${{ runner.temp }}/complete-scheduler.patch
+            ${{ runner.temp }}/zed-unit-graph.json
+            ${{ runner.temp }}/zed-shape.json
+            ${{ runner.temp }}/probe.json
+          if-no-files-found: warn
