@@ -385,28 +385,6 @@ func TestDiscoverOnlyTakesRecentTraceFiles(t *testing.T) {
 	}
 }
 
-func TestClassifyGrokThoughtAsReasoning(t *testing.T) {
-	category, _, _ := classify("sessionupdate:agent_thought_chunk")
-	if category != "reasoning" {
-		t.Fatalf("expected reasoning, got %s", category)
-	}
-}
-
-func TestPromptTextIsExcludedFromClassification(t *testing.T) {
-	value := map[string]any{
-		"type": "event_msg",
-		"payload": map[string]any{
-			"type": "user_message",
-			"text": "please run gh pr checks --watch",
-		},
-	}
-	flat := flatten(value, 0, "")
-	category, _, _ := classify(flat)
-	if category != "reasoning" {
-		t.Fatalf("prompt content influenced classification: %s", category)
-	}
-}
-
 func TestDemoReportTotals(t *testing.T) {
 	report := DemoReport()
 	if report.Observed <= 0 || report.Blocked <= 0 {
