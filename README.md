@@ -15,7 +15,7 @@ It can also inspect a public or private GitHub repository and summarize GitHub
 Actions latency.
 
 ```sh
-curl -fsSL https://zozo123.github.io/w | sh
+curl -fsSL https://zozo123.github.io/wasted | sh
 ```
 
 The runner downloads a checksum-verified release binary to a temporary
@@ -26,15 +26,15 @@ key, or upload.
 
 ```sh
 # Explore the TUI without local traces
-curl -fsSL https://zozo123.github.io/w |
+curl -fsSL https://zozo123.github.io/wasted |
   sh -s -- --demo
 
 # Scan 30 days of local agent traces
-curl -fsSL https://zozo123.github.io/w |
+curl -fsSL https://zozo123.github.io/wasted |
   sh -s -- --days 30
 
 # Analyze a public repository
-curl -fsSL https://zozo123.github.io/w |
+curl -fsSL https://zozo123.github.io/wasted |
   sh -s -- github nanoporetech/dorado
 
 # A URL works too; options may come before or after it
@@ -72,8 +72,8 @@ invent dollar savings.
 For reproducible production use, pin the release consumed by the installer:
 
 ```sh
-curl -fsSL https://zozo123.github.io/w |
-  WASTED_CYCLES_VERSION=v0.6.0 sh
+curl -fsSL https://zozo123.github.io/wasted |
+  WASTED_CYCLES_VERSION=v0.6.1 sh
 ```
 
 ### Supported sources
