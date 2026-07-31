@@ -388,7 +388,7 @@ func TestDiscoverOnlyTakesRecentTraceFiles(t *testing.T) {
 func TestDemoReportTotals(t *testing.T) {
 	report := DemoReport()
 	if report.Observed <= 0 || report.Blocked <= 0 {
-		t.Fatal("demo report should contain observed and recoverable time")
+		t.Fatal("demo report should contain observed and blocked time")
 	}
 	if report.Throughput <= 0 || report.Throughput >= 1 {
 		t.Fatalf("unexpected throughput: %f", report.Throughput)

@@ -34,13 +34,13 @@ func Plain(report Report) string {
 		return strings.Join(lines, "\n")
 	}
 
-	add("CI wait time        %9s   summed wall time across completed workflows", duration(report.CIWait))
-	add("Unsuccessful time  %9s   %s of CI wait", duration(report.UnsuccessfulTime), share(report.UnsuccessfulTime, report.CIWait))
-	add("Queue time         %9s   %s of CI wait", duration(report.QueueWait), share(report.QueueWait, report.CIWait))
-	add("Average run        %9s", duration(report.AverageRun))
-	add("Success rate       %8.0f%%   %d of %d completed runs", report.SuccessRate*100, report.SuccessfulRuns, report.CompletedRuns)
+	add("Workflow latency  %9s   summed elapsed time", duration(report.CIWait))
+	add("Unsuccessful     %9s   %s of workflow latency", duration(report.UnsuccessfulTime), share(report.UnsuccessfulTime, report.CIWait))
+	add("Queue delay      %9s   %s of workflow latency", duration(report.QueueWait), share(report.QueueWait, report.CIWait))
+	add("Median / p95    %9s / %s", duration(report.MedianRun), duration(report.P95Run))
+	add("Success rate     %8.0f%%   %d of %d completed runs", report.SuccessRate*100, report.SuccessfulRuns, report.CompletedRuns)
 	if report.RunningRuns > 0 || report.SkippedRuns > 0 {
-		add("Excluded           %9s   %d running, %d missing/invalid timestamps", "", report.RunningRuns, report.SkippedRuns)
+		add("Excluded         %9s   %d running, %d missing/invalid timestamps", "", report.RunningRuns, report.SkippedRuns)
 	}
 
 	if len(report.Workflows) > 0 {
@@ -57,25 +57,20 @@ func Plain(report Report) string {
 
 	if len(report.LongestRuns) > 0 {
 		add("")
-		add("LONGEST RUNS")
+		add("SLOWEST RUNS")
 		for index, run := range report.LongestRuns {
 			if index >= 5 {
 				break
 			}
-			title := strings.TrimSpace(run.Title)
-			if title == "" {
-				title = run.Name
-			}
-			add("  %-42s %9s   %s", truncate(title, 42), duration(run.CIWait), conclusionLabel(run.Conclusion))
-			add("    %s", run.URL)
+			add("  %-30s %9s   %s", truncate(run.Name, 30), duration(run.CIWait), conclusionLabel(run.Conclusion))
 		}
 	}
 
 	add("")
 	add("METHOD")
-	add("CI wait is created_at → updated_at for each completed workflow run.")
-	add("Runs that overlap are counted separately. This is repository CI latency,")
-	add("not billed runner-minutes and not proof that a person or agent waited for every run.")
+	add("Workflow latency is created_at → updated_at for each completed run.")
+	add("Overlapping runs count separately. This measures repository latency, not")
+	add("billed runner-minutes or proof that a person waited for every run.")
 	return strings.Join(lines, "\n")
 }
 

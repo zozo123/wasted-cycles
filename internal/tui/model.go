@@ -170,7 +170,10 @@ func defaultScan(window analyze.Window) (analyze.Report, error) {
 }
 
 func (m Model) View() string {
-	width := max(m.width, 60)
+	width := max(m.width, 1)
+	if width < 60 || m.height < 16 {
+		return m.compact(width)
+	}
 	body := min(width-4, 110)
 
 	var content string
@@ -199,7 +202,7 @@ func (m Model) header(width int) string {
 	top := spread(mark, m.rangeChips(), width)
 
 	var tabs []string
-	for index, label := range []string{"1 OVERVIEW", "2 HISTOGRAM", "3 RUNS", "4 METHOD"} {
+	for index, label := range []string{"1 OVERVIEW", "2 BREAKDOWN", "3 SESSIONS", "4 METHOD"} {
 		style := lipgloss.NewStyle().Padding(0, 1).Foreground(muted)
 		if index == m.tab {
 			style = style.Foreground(ink).Bold(true).Background(faint)
@@ -246,11 +249,58 @@ func (m Model) statusBanner(width int) string {
 }
 
 func (m Model) footer(width int) string {
-	left, right := "←/→ view   W/M/Y range   q quit", "local only · no uploads"
+	left, right := "←/→ view   W/M/Y range   q quit", "reads local traces · no uploads"
 	if lipgloss.Width(left)+lipgloss.Width(right)+1 > width {
 		left, right = "←/→ · W/M/Y · q", "local only"
 	}
 	return lipgloss.NewStyle().Foreground(muted).Render(spread(left, right, width))
+}
+
+func (m Model) compact(width int) string {
+	if width < 1 {
+		width = 1
+	}
+	inner := max(1, width-2)
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(brand).Render(truncate("WASTED CYCLES", inner)),
+		lipgloss.NewStyle().Foreground(muted).Render(truncate(windowLabel(m.report)+" · "+m.scopeMeta(), inner)),
+	}
+	if banner := m.statusBanner(inner); banner != "" {
+		lines = append(lines, "", banner)
+	}
+	if len(m.report.Sessions) == 0 {
+		lines = append(lines, "",
+			lipgloss.NewStyle().Bold(true).Foreground(blocked).Render(truncate("No supported traces found", inner)),
+			lipgloss.NewStyle().Foreground(muted).Render(truncate("Try --days 30 or --demo", inner)),
+		)
+	} else {
+		lines = append(lines, "",
+			compactMetric("Agent loop", duration(m.report.Observed), inner, ink),
+			compactMetric("Blocked", duration(m.report.Blocked)+" · "+share(m.report.Blocked, m.report.Observed), inner, blocked),
+			compactMetric("Flow", fmt.Sprintf("%.0f%%", m.report.Throughput*100), inner, working),
+			compactMetric("Human", duration(m.report.Human), inner, outside),
+		)
+		if len(m.report.Findings) > 0 {
+			finding := m.report.Findings[0]
+			lines = append(lines, "",
+				lipgloss.NewStyle().Foreground(muted).Render(truncate("TOP STALL", inner)),
+				lipgloss.NewStyle().Bold(true).Foreground(ink).Render(truncate(finding.Title, inner)),
+				lipgloss.NewStyle().Foreground(blocked).Render(truncate(duration(finding.Duration)+" blocked", inner)),
+			)
+		}
+	}
+	footer := lipgloss.NewStyle().Foreground(muted).Render(truncate("Enlarge for details · q quit", inner))
+	lines = append(lines, "", footer)
+	if height := max(m.height, 1); len(lines) > height {
+		lines = append(lines[:max(0, height-1)], footer)
+	}
+	return lipgloss.NewStyle().MarginLeft(min(1, max(0, width-1))).Render(strings.Join(lines, "\n"))
+}
+
+func compactMetric(label, value string, width int, colour lipgloss.Color) string {
+	left := lipgloss.NewStyle().Foreground(muted).Render(label)
+	right := lipgloss.NewStyle().Bold(true).Foreground(colour).Render(value)
+	return spread(left, right, width)
 }
 
 func (m Model) overview(width int) string {
@@ -265,10 +315,10 @@ func (m Model) overview(width int) string {
 	}
 	cardWidth := max(17, (width-perRow+1)/perRow)
 	cards := []string{
-		card(cardWidth, "AGENT TIME", duration(report.Observed), "excl. human", ink),
+		card(cardWidth, "AGENT LOOP", duration(report.Observed), "machine-observed", ink),
 		card(cardWidth, "BLOCKED", duration(report.Blocked), share(report.Blocked, report.Observed)+" of agent", blocked),
-		card(cardWidth, "THROUGHPUT", fmt.Sprintf("%.0f%%", report.Throughput*100), verdict(report.Throughput), working),
-		card(cardWidth, "HUMAN TIME", duration(report.Human), "not counted", outside),
+		card(cardWidth, "FLOW", fmt.Sprintf("%.0f%%", report.Throughput*100), verdict(report.Throughput), working),
+		card(cardWidth, "HUMAN", duration(report.Human), "outside the metric", outside),
 	}
 	var rows []string
 	for start := 0; start < len(cards); start += perRow {
@@ -315,7 +365,7 @@ func (m Model) summary(width int) string {
 		glyph     string
 		colour    lipgloss.Color
 	}{
-		{analyze.GroupWorking, "Coding", "█", working},
+		{analyze.GroupWorking, "Working", "█", working},
 		{analyze.GroupBlocked, "Blocked", "█", blocked},
 		{analyze.GroupExcluded, "Not counted", "░", outside},
 	} {
@@ -413,7 +463,7 @@ func barRow(category analyze.Category, peak time.Duration, labelWidth, barWidth 
 
 func legend() string {
 	return lipgloss.NewStyle().Foreground(working).Render("█") +
-		lipgloss.NewStyle().Foreground(muted).Render(" coding   ") +
+		lipgloss.NewStyle().Foreground(muted).Render(" working   ") +
 		lipgloss.NewStyle().Foreground(blocked).Render("█") +
 		lipgloss.NewStyle().Foreground(muted).Render(" blocked on compute   ") +
 		lipgloss.NewStyle().Foreground(blocked).Render("▒") +
@@ -440,38 +490,11 @@ func (m Model) leaks(width int) string {
 			lines = append(lines,
 				lipgloss.NewStyle().Foreground(blocked).Bold(true).Render(fmt.Sprintf("%d ", index+1))+
 					lipgloss.NewStyle().Bold(true).Foreground(ink).Render(truncate(finding.Title, width-2)),
-				lipgloss.NewStyle().Foreground(muted).Render(wrap(duration(finding.Recoverable)+" on the critical path", width)),
+				lipgloss.NewStyle().Foreground(muted).Render(wrap(duration(finding.Duration)+" blocked · "+finding.Action, width)),
 			)
 		}
 	}
-	if savings := m.report.Savings; savings != nil {
-		lines = append(lines, "",
-			heading("IF FIXED", "illustrative"),
-			lipgloss.NewStyle().Foreground(ink).Render(truncate(savingsHeadline(savings), width)),
-			lipgloss.NewStyle().Foreground(muted).Render(wrap("Illustrative only — not a quote. See Method.", width)),
-		)
-	}
 	return strings.Join(lines, "\n")
-}
-
-func savingsHeadline(savings *analyze.Savings) string {
-	line := fmt.Sprintf("~%s  ·  ~%s eng  ·  ~%s CI",
-		duration(savings.Addressable), moneyUSD(savings.EngineerUSD), moneyUSD(savings.ComputeUSD))
-	if savings.AnnualEngineerUSD > 0 {
-		line += fmt.Sprintf("  ·  ~%s/yr eng", moneyUSD(savings.AnnualEngineerUSD))
-	}
-	return line
-}
-
-func moneyUSD(value float64) string {
-	switch {
-	case value < 1:
-		return fmt.Sprintf("$%.2f", value)
-	case value < 1000:
-		return fmt.Sprintf("$%.0f", value)
-	default:
-		return fmt.Sprintf("$%.0fk", math.Round(value/1000))
-	}
 }
 
 func (m Model) runs(width int) string {
@@ -484,7 +507,7 @@ func (m Model) runs(width int) string {
 	project := max(8, min(22, inner-46))
 
 	layout := "%-9s %-" + fmt.Sprint(project) + "s %9s %9s %7s"
-	heads := []any{"HARNESS", "PROJECT", "AGENT", "BLOCKED", "THRUPUT"}
+	heads := []any{"HARNESS", "PROJECT", "AGENT", "BLOCKED", "FLOW"}
 	if showEnded {
 		layout += " %11s"
 		heads = append(heads, "ENDED")
@@ -495,7 +518,7 @@ func (m Model) runs(width int) string {
 	}
 
 	lines := []string{
-		heading("RUN COMPARISON", "which harness keeps moving?"), "",
+		heading("SESSION COMPARISON", "where did the machine block progress?"), "",
 		lipgloss.NewStyle().Foreground(muted).Render(fmt.Sprintf(layout, heads...)),
 		lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("─", max(1, min(inner, 88)))),
 	}
@@ -531,7 +554,7 @@ func (m Model) runs(width int) string {
 		lines = append(lines, lipgloss.NewStyle().Foreground(colour).Render(fmt.Sprintf(layout, values...)))
 	}
 
-	note := "Throughput = agent time that was not spent waiting on a machine. Human time is excluded."
+	note := "Flow = agent-loop time that was not spent waiting on a machine. Human time is excluded."
 	if coarse && showDetail {
 		note += "\nturn = the harness stamps no per-event times, so a segment spans a whole turn."
 	}
@@ -555,25 +578,12 @@ func (m Model) method(width int) string {
 		label, body string
 		colour      lipgloss.Color
 	}{
-		{"A wasted cycle", "Time blocked on a machine you do not control: builds, tests, CI, containers, packages, sub-agents. A repeat counts twice — the machine did the work twice.", blocked},
-		{"Not counted", "Waiting on a person. Reported beside the metric, never inside it.", outside},
-		{"Gaps", "Over 2h is a session break and is dropped. Shorter gaps are capped at 30m and marked clamped. " + inferredNote(m.report), ink},
-		{"Soft edges", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Cursor and Grok only stamp turns, so a segment spans a whole turn. Scheduled Cursor agents that tick on a fixed interval are dropped. Per-segment confidence is in --json.", ink},
-		{"Detected", sources, ink},
+		{"Blocked", "Elapsed agent-loop time attributed to builds, tests, CI, containers, packages, sub-agents, or repeated machine work.", blocked},
+		{"Excluded", "Time waiting on a person is shown separately and never counted as blocked.", outside},
+		{"Boundaries", "A gap over 2h starts a new session. Shorter gaps are capped at 30m and marked inferred. " + inferredNote(m.report), ink},
+		{"Resolution", "\u201cModel work\u201d is the interval after a message or tool result, not measured GPU time. Cursor and Grok expose turn timestamps, so those segments span a whole turn. Confidence is included in --json.", ink},
+		{"Sources", sources, ink},
 		{"Window", fmt.Sprintf("%s from %s. Press W / M / Y or [ ] to rescan.", m.window.Label(), m.report.Since.Local().Format("2006-01-02")), ink},
-	}
-	if savings := m.report.Savings; savings != nil {
-		options := "Incredibuild Build Runner, Blacksmith, CircleCI — informational links only."
-		rows = append(rows,
-			struct {
-				label, body string
-				colour      lipgloss.Color
-			}{"If fixed", savings.Assumptions + " " + savingsHeadline(savings), blocked},
-			struct {
-				label, body string
-				colour      lipgloss.Color
-			}{"Disclaimer", savings.Disclaimer + " Options: " + options, outside},
-		)
 	}
 
 	lines := []string{heading("METHOD & LIMITS", "use the number, know its edges"), ""}
@@ -665,9 +675,9 @@ func verdict(value float64) string {
 	case value >= .95:
 		return "rarely blocked"
 	case value >= .8:
-		return "room to recover"
+		return "some machine wait"
 	default:
-		return "path blocked"
+		return "frequently blocked"
 	}
 }
 

@@ -97,10 +97,24 @@ if [ "${#built[@]}" -ne "$lines" ]; then
   fail=1
 fi
 
-# 5. The version ldflag actually landed: a host-native binary must print the
-#    tag rather than the "dev" default baked into cmd/wasted-cycles/main.go.
-native="$root/build/linux_amd64/wasted-cycles"
-if [ -n "${TAG:-}" ] && [ -x "$native" ]; then
+# 5. The version ldflag actually landed: execute the binary built for this
+#    host, whether the verifier runs on Linux in CI or macOS during release QA.
+case "$(uname -s)" in
+  Darwin) host_os="darwin" ;;
+  Linux) host_os="linux" ;;
+  *) host_os="" ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) host_arch="amd64" ;;
+  arm64|aarch64) host_arch="arm64" ;;
+  *) host_arch="" ;;
+esac
+
+native=""
+if [ -n "$host_os" ] && [ -n "$host_arch" ]; then
+  native="$root/build/${host_os}_${host_arch}/wasted-cycles"
+fi
+if [ -n "${TAG:-}" ] && [ -n "$native" ] && [ -x "$native" ]; then
   got="$("$native" --version)"
   if [ "$got" != "$TAG" ]; then
     echo "--version printed '$got', expected '$TAG' (check -X main.version)" >&2

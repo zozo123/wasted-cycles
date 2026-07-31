@@ -70,6 +70,9 @@ func TestAnalyzeAggregatesCompletedRuns(t *testing.T) {
 	if report.SuccessRate != 2.0/3.0 {
 		t.Fatalf("success rate = %v", report.SuccessRate)
 	}
+	if report.AverageRun != 11*time.Minute || report.MedianRun != 11*time.Minute || report.P95Run != 20*time.Minute {
+		t.Fatalf("average=%s median=%s p95=%s", report.AverageRun, report.MedianRun, report.P95Run)
+	}
 	if len(report.Workflows) != 2 || report.Workflows[0].Name != "build" || report.Workflows[0].CIWait != 31*time.Minute {
 		t.Fatalf("workflows = %#v", report.Workflows)
 	}
@@ -103,11 +106,12 @@ func TestPlainExplainsMetric(t *testing.T) {
 		Runs: 2, CompletedRuns: 2, SuccessfulRuns: 1, UnsuccessfulRuns: 1,
 		SuccessRate: .5, CIWait: time.Hour, UnsuccessfulTime: 20 * time.Minute,
 		QueueWait: 5 * time.Minute, AverageRun: 30 * time.Minute,
+		MedianRun: 25 * time.Minute, P95Run: 40 * time.Minute,
 		Workflows:   []Workflow{{Name: "build", Runs: 2, UnsuccessfulRuns: 1, CIWait: time.Hour}},
 		LongestRuns: []Run{{Title: "slow build", Conclusion: "failure", CIWait: 40 * time.Minute, URL: "https://github.com/acme/widgets/actions/runs/1"}},
 	}
 	output := Plain(report)
-	for _, want := range []string{"WASTED CYCLES · GITHUB ACTIONS", "CI wait time", "Unsuccessful time", "MOST TIME BY WORKFLOW", "LONGEST RUNS", "not billed runner-minutes"} {
+	for _, want := range []string{"WASTED CYCLES · GITHUB ACTIONS", "Workflow latency", "Median / p95", "MOST TIME BY WORKFLOW", "SLOWEST RUNS", "not", "billed runner-minutes"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("plain output missing %q:\n%s", want, output)
 		}
