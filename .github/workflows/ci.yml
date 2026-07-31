@@ -8,26 +8,209 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  go:
+  lint:
+    name: gofmt + vet
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test ./cmd/... ./internal/...
-      - run: go vet ./cmd/... ./internal/...
-      - run: go build ./cmd/wasted-cycles
 
-  pages-site:
-    runs-on: ubuntu-latest
+      - name: gofmt (must report no files)
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            echo "Run: gofmt -w ."
+            exit 1
+          fi
+          echo "gofmt clean"
+
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
         with:
-          node-version: 22.13.0
-          cache: npm
-      - run: npm ci
-      - run: npm run build
+          go-version-file: go.mod
+          cache: true
+
+      # -race requires cgo and a C toolchain. ubuntu-latest ships gcc, so the
+      # race detector is available there; macOS runs the plain test suite to
+      # keep the job independent of the Xcode CLT state on the runner image.
+      - name: go test -race
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./...
+
+      - name: go test
+        if: runner.os != 'Linux'
+        run: go test -count=1 ./...
+
+  cross-compile:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile smoke build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          out="wasted-cycles"
+          if [ "$GOOS" = "windows" ]; then
+            out="wasted-cycles.exe"
+          fi
+          go build -trimpath -ldflags "-s -w" -o "/tmp/$out" ./cmd/wasted-cycles
+          ls -l "/tmp/$out"
+
+  package-contract:
+    name: release packaging contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Runs the same two scripts the release workflow runs, so a break in the
+      # asset names, the checksums.txt format, the archive layout, or the
+      # -X main.version ldflag fails a pull request instead of being discovered
+      # halfway through cutting a tag.
+      - name: Package a dry-run release
+        env:
+          TAG: v0.0.0-ci
+        run: bash .github/scripts/package.sh
+
+      - name: Verify the `run` installer contract
+        env:
+          TAG: v0.0.0-ci
+        run: bash .github/scripts/verify-assets.sh
+
+      # Full end-to-end of the published install path: serve dist/ over HTTP,
+      # point ./run at it, and let the real script download, look the checksum
+      # up with its own awk expression, extract, and execute the binary.
+      - name: Exercise ./run end to end
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8000 --directory dist --bind 127.0.0.1 &
+          server=$!
+          trap 'kill "$server"' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS -o /dev/null http://127.0.0.1:8000/checksums.txt 2>/dev/null && break
+            sleep 0.2
+          done
+
+          sed 's#https://github.com/\$repo/releases/latest/download#http://127.0.0.1:8000#' run > /tmp/run-local
+          got="$(sh /tmp/run-local --version < /dev/null)"
+          echo "./run --version -> $got"
+          [ "$got" = "v0.0.0-ci" ]
+
+  shellcheck:
+    name: shellcheck shell sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # shellcheck ships preinstalled on the ubuntu-latest runner image, but do
+      # not depend on that: install it if the binary is missing.
+      - name: Ensure shellcheck is available
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+
+      - name: shellcheck ./run
+        run: shellcheck --shell=sh --severity=style run
+
+      - name: shellcheck release scripts
+        run: shellcheck --shell=bash --severity=style .github/scripts/*.sh
+
+  demo-json:
+    name: demo JSON output
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Headless check only: --json returns before the bubbletea program is
+      # constructed, so no TTY is required. stdin is closed as well, so if that
+      # ever regresses the job fails fast instead of blocking on a read that
+      # never completes.
+      - name: Run --demo --json
+        run: go run ./cmd/wasted-cycles --demo --json < /dev/null > demo.json
+
+      - name: Validate JSON
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("demo.json", "r", encoding="utf-8") as fh:
+              data = json.load(fh)
+
+          if not isinstance(data, (dict, list)):
+              sys.exit("demo output is not a JSON object or array")
+          if not data:
+              sys.exit("demo output is empty")
+
+          print("valid JSON, top-level type:", type(data).__name__)
+          if isinstance(data, dict):
+              print("keys:", ", ".join(sorted(data)))
+          PY

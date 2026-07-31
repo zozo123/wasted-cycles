@@ -8,53 +8,80 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
+    name: Build, package, publish
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build release assets
-        env:
-          VERSION: ${{ github.ref_name }}
-          CGO_ENABLED: "0"
+
+      # A tag must not be able to publish code that never passed the suite.
+      # This job is triggered by the tag alone, so it cannot rely on CI having
+      # run on the same commit.
+      - name: Vet and test before publishing
         run: |
-          set -eu
-          mkdir -p release
-          for target in \
-            darwin/arm64 darwin/amd64 \
-            linux/arm64 linux/amd64 \
-            windows/arm64 windows/amd64
-          do
-            os="${target%/*}"
-            arch="${target#*/}"
-            display_arch="$arch"
-            [ "$display_arch" = "amd64" ] && display_arch="x86_64"
-            name="wasted-cycles_${os}_${display_arch}"
-            binary="wasted-cycles"
-            [ "$os" = "windows" ] && binary="wasted-cycles.exe"
-            GOOS="$os" GOARCH="$arch" go build \
-              -trimpath \
-              -ldflags "-s -w -X main.version=$VERSION" \
-              -o "release/$binary" ./cmd/wasted-cycles
-            if [ "$os" = "windows" ]; then
-              (cd release && zip -q "${name}.zip" "$binary")
-            else
-              (cd release && tar -czf "${name}.tar.gz" "$binary")
-            fi
-            rm "release/$binary"
-          done
-          (cd release && sha256sum *.tar.gz *.zip > checksums.txt)
-      - name: Publish GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+          go vet ./...
+          go test -count=1 ./...
+
+      # Reproducible-ish builds: fixed toolchain (go.mod), CGO off, -trimpath,
+      # no VCS stamping, and a deterministic archive timestamp derived from the
+      # tagged commit rather than "now".
+      - name: Resolve release metadata
+        id: meta
         run: |
-          gh release create "${{ github.ref_name }}" release/* \
-            --repo "${{ github.repository }}" \
-            --title "Wasted Cycles ${{ github.ref_name }}" \
-            --generate-notes
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          epoch="$(git log -1 --pretty=%ct "${GITHUB_SHA}")"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+          echo "Releasing ${tag} (SOURCE_DATE_EPOCH=${epoch})"
+
+      # Same script CI runs on every pull request, so the packaging contract
+      # cannot drift between the two workflows.
+      - name: Build and package all targets
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: bash .github/scripts/package.sh
+
+      - name: Verify the `run` installer contract
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: bash .github/scripts/verify-assets.sh
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # `run` downloads from /releases/latest/download. GitHub excludes
+          # pre-releases from "latest", so a tag carrying a pre-release suffix
+          # (v1.2.0-rc.1, v1.2.0-beta) must be published as one -- otherwise it
+          # becomes the default download for every `curl | sh` user.
+          flags=""
+          case "$TAG" in
+            *-*) flags="--prerelease" ;;
+          esac
+
+          # shellcheck disable=SC2086 # $flags is a deliberate word-split flag list
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag \
+            $flags \
+            dist/wasted-cycles_* \
+            dist/checksums.txt

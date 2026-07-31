@@ -1,9 +1,15 @@
+# Go build output
+/wasted-cycles
+/wasted-cycles.exe
+/dist/
+/build/
+*.test
+*.out
+
 node_modules/
 .next/
 .vinext/
 .wrangler/
-dist/
 bin/
 coverage/
 .DS_Store
-*.test
