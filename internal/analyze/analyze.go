@@ -59,11 +59,11 @@ type Session struct {
 }
 
 type Finding struct {
-	Title       string        `json:"title"`
-	Detail      string        `json:"detail"`
-	Action      string        `json:"action"`
-	Category    string        `json:"category"`
-	Recoverable time.Duration `json:"recoverable_ns"`
+	Title    string        `json:"title"`
+	Detail   string        `json:"detail"`
+	Action   string        `json:"action"`
+	Category string        `json:"category"`
+	Duration time.Duration `json:"duration_ns"`
 }
 
 type Source struct {
@@ -83,7 +83,6 @@ type Report struct {
 	Sessions    []Session     `json:"sessions"`
 	Categories  []Category    `json:"categories"`
 	Findings    []Finding     `json:"findings"`
-	Savings     *Savings      `json:"savings,omitempty"`
 	Sources     []Source      `json:"sources"`
 	Scanned     int           `json:"files_scanned"`
 	Skipped     int           `json:"files_skipped"`
@@ -664,7 +663,6 @@ func finalize(report *Report) {
 		report.Throughput = float64(report.Observed-report.Blocked) / float64(report.Observed)
 	}
 	report.Findings = buildFindings(totals)
-	report.Savings = buildSavings(totals, report.Since)
 }
 
 func buildFindings(totals map[string]time.Duration) []Finding {
@@ -688,10 +686,10 @@ func buildFindings(totals map[string]time.Duration) []Finding {
 		}
 		out = append(out, Finding{
 			Title: item.Title, Detail: item.Detail, Action: item.Action,
-			Category: item.ID, Recoverable: totals[item.ID],
+			Category: item.ID, Duration: totals[item.ID],
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Recoverable > out[j].Recoverable })
+	sort.Slice(out, func(i, j int) bool { return out[i].Duration > out[j].Duration })
 	return out
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,6 +55,8 @@ type Report struct {
 	QueueWait         time.Duration `json:"queue_wait_ns"`
 	UnsuccessfulTime  time.Duration `json:"unsuccessful_ns"`
 	AverageRun        time.Duration `json:"average_run_ns"`
+	MedianRun         time.Duration `json:"median_run_ns"`
+	P95Run            time.Duration `json:"p95_run_ns"`
 	Workflows         []Workflow    `json:"workflows"`
 	LongestRuns       []Run         `json:"longest_runs"`
 	Truncated         bool          `json:"truncated"`
@@ -215,6 +218,7 @@ func Analyze(ctx context.Context, options Options) (Report, error) {
 func finalize(report *Report, rawRuns []apiRun) {
 	workflows := make(map[string]*Workflow)
 	runs := make([]Run, 0, len(rawRuns))
+	var durations []time.Duration
 
 	for _, raw := range rawRuns {
 		if raw.Status != "completed" {
@@ -248,6 +252,7 @@ func finalize(report *Report, rawRuns []apiRun) {
 			URL: raw.HTMLURL,
 		}
 		runs = append(runs, run)
+		durations = append(durations, wait)
 
 		workflow := workflows[name]
 		if workflow == nil {
@@ -274,6 +279,8 @@ func finalize(report *Report, rawRuns []apiRun) {
 	if report.CompletedRuns > 0 {
 		report.SuccessRate = float64(report.SuccessfulRuns) / float64(report.CompletedRuns)
 		report.AverageRun = report.CIWait / time.Duration(report.CompletedRuns)
+		report.MedianRun = percentile(durations, .5)
+		report.P95Run = percentile(durations, .95)
 	}
 	for _, workflow := range workflows {
 		report.Workflows = append(report.Workflows, *workflow)
@@ -294,6 +301,17 @@ func finalize(report *Report, rawRuns []apiRun) {
 		runs = runs[:10]
 	}
 	report.LongestRuns = runs
+}
+
+func percentile(values []time.Duration, quantile float64) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	index := int(math.Ceil(quantile*float64(len(sorted)))) - 1
+	index = max(0, min(index, len(sorted)-1))
+	return sorted[index]
 }
 
 func successful(conclusion string) bool {

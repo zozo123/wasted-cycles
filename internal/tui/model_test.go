@@ -47,7 +47,7 @@ func TestNoRenderedLineExceedsTheTerminal(t *testing.T) {
 	// A single over-wide line wraps and shifts everything below it, which is how
 	// the footer used to break every view at every width.
 	for name, report := range reports() {
-		for _, width := range []int{68, 74, 80, 100, 140} {
+		for _, width := range []int{20, 40, 59, 68, 74, 80, 100, 140} {
 			for tab := tabOverview; tab <= tabMethod; tab++ {
 				model, _ := New(report, "test", Config{}).Update(tea.WindowSizeMsg{Width: width, Height: 40})
 				view := model.(Model)
@@ -59,6 +59,20 @@ func TestNoRenderedLineExceedsTheTerminal(t *testing.T) {
 					}
 				}
 			}
+		}
+	}
+}
+
+func TestCompactViewFitsTerminalHeight(t *testing.T) {
+	for _, size := range []struct{ width, height int }{
+		{20, 3}, {40, 8}, {80, 12},
+	} {
+		model, _ := New(analyze.DemoReport(), "test", Config{}).Update(
+			tea.WindowSizeMsg{Width: size.width, Height: size.height},
+		)
+		lines := strings.Split(model.(Model).View(), "\n")
+		if len(lines) > size.height {
+			t.Fatalf("%dx%d rendered %d lines", size.width, size.height, len(lines))
 		}
 	}
 }
@@ -108,9 +122,14 @@ func TestTruncateIsRuneSafe(t *testing.T) {
 
 func TestPlainSummary(t *testing.T) {
 	output := Plain(analyze.DemoReport())
-	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "RUNS", "turn resolution", "cursor", "IF FIXED", "Illustrative only"} {
+	for _, want := range []string{"WASTED CYCLES", "WHERE THE TIME WENT", "Model work", "SESSIONS", "turn resolution", "cursor", "BIGGEST STALLS"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("plain output is missing %q:\n%s", want, output)
+		}
+	}
+	for _, unwanted := range []string{"IF FIXED", "Illustrative only", "$"} {
+		if strings.Contains(output, unwanted) {
+			t.Fatalf("plain output contains speculative copy %q:\n%s", unwanted, output)
 		}
 	}
 	empty := Plain(analyze.Report{Since: time.Now().Add(-24 * time.Hour)})

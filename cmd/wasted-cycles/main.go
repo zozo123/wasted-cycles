@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,28 +22,55 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "github" {
-		os.Exit(runGitHub(os.Args[2:], os.Stdout, os.Stderr))
-	}
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	var (
-		days    = flag.Int("days", 7, "number of recent days to analyze (overridden by --ytd)")
-		ytd     = flag.Bool("ytd", false, "analyze from January 1 of this year")
-		demo    = flag.Bool("demo", false, "open the TUI with a realistic demo report")
-		asJSON  = flag.Bool("json", false, "print the report as JSON")
-		plain   = flag.Bool("plain", false, "print a plain-text summary instead of the TUI")
-		noAlt   = flag.Bool("no-alt-screen", false, "render without the terminal alternate screen")
-		showVer = flag.Bool("version", false, "print version")
-	)
-	flag.Parse()
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "github":
+			return runGitHub(args[1:], stdout, stderr)
+		case "help":
+			if len(args) > 1 && args[1] == "github" {
+				return runGitHub([]string{"--help"}, stdout, stderr)
+			}
+			printUsage(stdout)
+			return 0
+		}
+	}
+	return runLocal(args, stdout, stderr)
+}
+
+func runLocal(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("wasted-cycles", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	days := flags.Int("days", 7, "days of local trace history (1–365)")
+	ytd := flags.Bool("ytd", false, "scan from January 1")
+	demo := flags.Bool("demo", false, "use the built-in sample report")
+	asJSON := flags.Bool("json", false, "print JSON")
+	plain := flags.Bool("plain", false, "print text instead of the TUI")
+	noAlt := flags.Bool("no-alt-screen", false, "keep the TUI in the current screen")
+	showVer := flags.Bool("version", false, "print the version")
+	flags.Usage = func() { printUsage(stderr) }
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "wasted-cycles: unexpected argument %q\n\n", flags.Arg(0))
+		printUsage(stderr)
+		return 2
+	}
 
 	if *showVer {
-		fmt.Println(version)
-		return
+		fmt.Fprintln(stdout, version)
+		return 0
 	}
 	if *days < 1 || *days > 365 {
-		fmt.Fprintln(os.Stderr, "--days must be between 1 and 365")
-		os.Exit(2)
+		fmt.Fprintln(stderr, "wasted-cycles: --days must be between 1 and 365")
+		return 2
 	}
 
 	now := time.Now()
@@ -61,27 +89,28 @@ func main() {
 			MaxGap: 30 * time.Minute,
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "wasted-cycles: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "wasted-cycles: %v\n", err)
+			return 1
 		}
 	}
 
 	if *asJSON {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(report); err != nil {
-			fmt.Fprintf(os.Stderr, "wasted-cycles: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "wasted-cycles: %v\n", err)
+			return 1
 		}
-		return
+		return 0
 	}
 
-	if *plain || !term.IsTerminal(os.Stdout.Fd()) {
-		fmt.Println(tui.Plain(report))
-		return
+	outputFile, isFile := stdout.(*os.File)
+	if *plain || !isFile || !term.IsTerminal(outputFile.Fd()) {
+		fmt.Fprintln(stdout, tui.Plain(report))
+		return 0
 	}
 
-	programOptions := []tea.ProgramOption{tea.WithOutput(os.Stdout)}
+	programOptions := []tea.ProgramOption{tea.WithOutput(stdout)}
 	if !*noAlt {
 		programOptions = append(programOptions, tea.WithAltScreen())
 	}
@@ -90,43 +119,60 @@ func main() {
 		Demo:   *demo,
 	})
 	if _, err := tea.NewProgram(model, programOptions...).Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "wasted-cycles: interactive terminal unavailable, falling back to plain output")
-		fmt.Println(tui.Plain(report))
+		fmt.Fprintln(stderr, "wasted-cycles: TUI unavailable; printing text report")
+		fmt.Fprintln(stdout, tui.Plain(report))
 	}
+	return 0
+}
+
+func printUsage(output io.Writer) {
+	fmt.Fprintln(output, "Wasted Cycles — find machine time blocking agent work")
+	fmt.Fprintln(output, "")
+	fmt.Fprintln(output, "Usage:")
+	fmt.Fprintln(output, "  wasted-cycles [options]")
+	fmt.Fprintln(output, "  wasted-cycles github [options] OWNER/REPO")
+	fmt.Fprintln(output, "")
+	fmt.Fprintln(output, "Local options:")
+	fmt.Fprintln(output, "  --days N          history to scan (default 7, max 365)")
+	fmt.Fprintln(output, "  --ytd             scan from January 1")
+	fmt.Fprintln(output, "  --demo            use the built-in sample report")
+	fmt.Fprintln(output, "  --json            print JSON")
+	fmt.Fprintln(output, "  --plain           print text instead of the TUI")
+	fmt.Fprintln(output, "  --no-alt-screen   keep the TUI in the current screen")
+	fmt.Fprintln(output, "  --version         print the version")
+	fmt.Fprintln(output, "")
+	fmt.Fprintln(output, "Run `wasted-cycles help github` for repository analysis options.")
 }
 
 func runGitHub(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("wasted-cycles github", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	days := flags.Int("days", 7, "number of recent days to analyze (overridden by --ytd)")
-	ytd := flags.Bool("ytd", false, "analyze runs created since January 1 of this year")
-	asJSON := flags.Bool("json", false, "print the report as JSON")
+	days := flags.Int("days", 7, "days of workflow history (1–365)")
+	ytd := flags.Bool("ytd", false, "scan runs created since January 1")
+	asJSON := flags.Bool("json", false, "print JSON")
 	maxRuns := flags.Int("max-runs", 1000, "maximum workflow runs to fetch")
-	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: wasted-cycles github [flags] OWNER/REPO")
-		fmt.Fprintln(stderr, "   or: wasted-cycles github [flags] https://github.com/OWNER/REPO")
-		fmt.Fprintln(stderr, "")
-		fmt.Fprintln(stderr, "Measures elapsed GitHub Actions workflow time. Public repositories work")
-		fmt.Fprintln(stderr, "without authentication; private repositories use an authenticated gh CLI.")
-		fmt.Fprintln(stderr, "")
-		flags.PrintDefaults()
+	flags.Usage = func() { printGitHubUsage(stderr) }
+	normalized, err := normalizeGitHubArgs(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "wasted-cycles github: %v\n", err)
+		return 2
 	}
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(normalized); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
 	if flags.NArg() != 1 {
-		flags.Usage()
+		printGitHubUsage(stderr)
 		return 2
 	}
 	if *days < 1 || *days > 365 {
-		fmt.Fprintln(stderr, "--days must be between 1 and 365")
+		fmt.Fprintln(stderr, "wasted-cycles github: --days must be between 1 and 365")
 		return 2
 	}
 	if *maxRuns < 1 || *maxRuns > 10000 {
-		fmt.Fprintln(stderr, "--max-runs must be between 1 and 10000")
+		fmt.Fprintln(stderr, "wasted-cycles github: --max-runs must be between 1 and 10000")
 		return 2
 	}
 
@@ -161,6 +207,54 @@ func runGitHub(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, githubactions.Plain(report))
 	return 0
+}
+
+func printGitHubUsage(output io.Writer) {
+	fmt.Fprintln(output, "Analyze GitHub Actions workflow latency")
+	fmt.Fprintln(output, "")
+	fmt.Fprintln(output, "Usage:")
+	fmt.Fprintln(output, "  wasted-cycles github [options] OWNER/REPO")
+	fmt.Fprintln(output, "  wasted-cycles github [options] https://github.com/OWNER/REPO")
+	fmt.Fprintln(output, "")
+	fmt.Fprintln(output, "Options:")
+	fmt.Fprintln(output, "  --days N       workflow history (default 7, max 365)")
+	fmt.Fprintln(output, "  --ytd          scan runs created since January 1")
+	fmt.Fprintln(output, "  --max-runs N   fetch cap (default 1000, max 10000)")
+	fmt.Fprintln(output, "  --json         print JSON")
+	fmt.Fprintln(output, "")
+	fmt.Fprintln(output, "Public repositories need no login. Private repositories use `gh auth login`,")
+	fmt.Fprintln(output, "GH_TOKEN, or GITHUB_TOKEN.")
+}
+
+// The standard flag package stops at the first positional argument. Accept the
+// friendlier `github OWNER/REPO --days 30` form by moving known options before
+// the one repository argument.
+func normalizeGitHubArgs(args []string) ([]string, error) {
+	var options, positional []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		name := strings.SplitN(arg, "=", 2)[0]
+		switch name {
+		case "--days", "-days", "--max-runs", "-max-runs":
+			options = append(options, arg)
+			if !strings.Contains(arg, "=") {
+				if index+1 >= len(args) {
+					return nil, fmt.Errorf("%s needs a value", arg)
+				}
+				index++
+				options = append(options, args[index])
+			}
+		case "--ytd", "-ytd", "--json", "-json", "--help", "-help", "-h":
+			options = append(options, arg)
+		default:
+			if strings.HasPrefix(arg, "-") {
+				options = append(options, arg)
+				continue
+			}
+			positional = append(positional, arg)
+		}
+	}
+	return append(options, positional...), nil
 }
 
 func resolveWindow(ytd bool, days int, now time.Time) (analyze.Window, time.Time) {

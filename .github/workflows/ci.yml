@@ -39,6 +39,9 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: Validate GitHub Pages HTML
+        run: npx --yes html-validate@11.6.0 docs/index.html
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

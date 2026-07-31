@@ -26,10 +26,10 @@ func Plain(report analyze.Report) string {
 		return strings.Join(lines, "\n")
 	}
 
-	add("Agent time         %s   (excludes time waiting on you)", duration(report.Observed))
-	add("Blocked on compute %s   %s of agent time", duration(report.Blocked), share(report.Blocked, report.Observed))
-	add("Throughput         %-9s %s", fmt.Sprintf("%.0f%%", report.Throughput*100), verdict(report.Throughput))
-	add("Outside the loop   %s   waiting on you, not counted", duration(report.Human))
+	add("Agent loop  %9s   machine-observed time", duration(report.Observed))
+	add("Blocked     %9s   %s of the agent loop", duration(report.Blocked), share(report.Blocked, report.Observed))
+	add("Flow        %8.0f%%   %s", report.Throughput*100, verdict(report.Throughput))
+	add("Human       %9s   outside the metric", duration(report.Human))
 	add("")
 
 	add("WHERE THE TIME WENT")
@@ -74,38 +74,31 @@ func Plain(report analyze.Report) string {
 			if index >= 3 {
 				break
 			}
-			add("  %d. %s (%s)", index+1, finding.Title, duration(finding.Recoverable))
+			add("  %d. %s (%s blocked)", index+1, finding.Title, duration(finding.Duration))
 			add("     %s", finding.Action)
 		}
 	}
 
-	if savings := report.Savings; savings != nil {
-		add("")
-		add("IF FIXED (illustrative)")
-		add("  %s", savingsHeadline(savings))
-		add("  %s", savings.Disclaimer)
-		add("  Options: Incredibuild Build Runner · Blacksmith · CircleCI")
-	}
-
 	add("")
-	add("RUNS")
+	add("SESSIONS")
 	for index, session := range report.Sessions {
-		if index >= 12 {
-			add("  … and %d more", len(report.Sessions)-12)
+		if index >= 8 {
+			add("  … and %d more", len(report.Sessions)-8)
 			break
 		}
 		note := ""
 		if session.Resolution == "turn" {
 			note = "  (turn resolution)"
 		}
-		add("  %-8s %-24s %9s  %3.0f%% throughput%s",
+		add("  %-8s %-24s %9s  %3.0f%% flow%s",
 			session.Provider, truncate(session.Project, 24), duration(session.Duration),
 			session.Throughput*100, note)
 	}
 
 	add("")
-	add("A wasted cycle is time blocked on a machine: builds, tests, CI, containers,")
-	add("packages, sub-agents. Time waiting on a person is reported but never counted.")
+	add("Blocked time is elapsed agent-loop time attributed to builds, tests, CI,")
+	add("containers, packages, sub-agents, or repeated machine work.")
+	add("Human wait is reported separately and never counted as blocked.")
 	add("%s", inferredNote(report))
 	add("Run with --json for the full report, or in a terminal for the TUI.")
 	return strings.Join(lines, "\n")

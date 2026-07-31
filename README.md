@@ -1,220 +1,143 @@
 # Wasted Cycles
 
 [![CI](https://github.com/zozo123/wasted-cycles/actions/workflows/ci.yml/badge.svg)](https://github.com/zozo123/wasted-cycles/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/zozo123/wasted-cycles)](https://github.com/zozo123/wasted-cycles/releases/latest)
+[![Pages](https://img.shields.io/badge/demo-GitHub%20Pages-05A388)](https://zozo123.github.io/wasted-cycles/)
 
-**Find the machines your coding agent is waiting on.**
+**Find the machine time blocking agent work.**
 
-A wasted cycle is time your agent spends blocked on compute it does not
-control — compiling, running tests, waiting on CI, provisioning containers,
-fetching packages, joining sub-agents. Wasted Cycles reads the traces already on
-your machine and shows you how much of a run was that, and which machine to fix
-first. It can also inspect a GitHub repository and total the wall-clock time
-spent in GitHub Actions.
+Wasted Cycles is a local-first wall-clock profiler for Codex, Claude Code,
+Cursor, and Grok Build. It reads their existing traces, separates useful agent
+work from machine waits, and ranks the build, test, CI, container, package, and
+sub-agent stalls worth fixing.
 
-Time spent waiting on a *person* is not a wasted cycle. It is reported
-separately and never enters the metric.
+It can also inspect a public or private GitHub repository and summarize GitHub
+Actions latency.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh
 ```
 
-The runner downloads a checksum-verified binary into a temporary directory,
-runs it, and deletes it on exit. There is no install, account, daemon, API key,
-or upload.
+The runner downloads a checksum-verified release binary to a temporary
+directory, runs it, and removes it. There is no install, account, daemon, API
+key, or upload.
 
-## What it answers
-
-- How much of a run was spent blocked on a machine instead of coding?
-- Which one — the compiler, the test suite, CI, containers, or the registry?
-- Is the same build or test running more than once?
-- Which coding harness keeps moving on your workload?
-- What is the highest-impact bottleneck to fix next?
-- Roughly how much time and money those waits might be worth to recover?
-- How much wall-clock time did this repository spend in GitHub Actions?
-
-Use the arrow keys to switch between Overview, Histogram, Runs, and Method.
-Press `W`, `M`, or `Y` to switch the lookback window. Press `q` to quit.
+## Start here
 
 ```sh
-# Explore with a realistic built-in dataset
+# Explore the TUI without local traces
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
   sh -s -- --demo
 
-# Scan a wider window
+# Scan 30 days of local agent traces
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
   sh -s -- --days 30
 
-# Year to date
-curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
-  sh -s -- --ytd
-
-# Machine-readable output
-curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
-  sh -s -- --json
-
-# Analyze GitHub Actions for a public repository
+# Analyze a public repository
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
   sh -s -- github nanoporetech/dorado
 
-# The repository can also be a URL; flags come before it
-curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
-  sh -s -- github --days 30 --json https://github.com/nanoporetech/dorado
+# A URL works too; options may come before or after it
+wasted-cycles github https://github.com/nanoporetech/dorado --days 30
 ```
 
-| Flag | Meaning |
+Use `←` / `→` to switch between Overview, Breakdown, Sessions, and Method.
+Press `W`, `M`, or `Y` to change the lookback window and `q` to quit. Small
+terminals get a compact summary automatically; pipes and redirects get plain
+text.
+
+## Local agent traces
+
+The four headline values are deliberately narrow:
+
+| Value | Meaning |
 | --- | --- |
-| `--days N` | Days of history to scan (default 7, max 365) |
-| `--ytd` | Scan from January 1 of this year |
-| `--demo` | Open the built-in demo dataset instead of your traces |
-| `--json` | Print the full report as JSON |
-| `--plain` | Print a plain-text summary instead of the TUI |
-| `--no-alt-screen` | Render without the terminal alternate screen |
-| `--version` | Print the version |
+| **Agent loop** | elapsed machine-observed work, excluding human wait |
+| **Blocked** | agent-loop time attributed to machine waits |
+| **Flow** | share of the agent loop not blocked on a machine |
+| **Human** | time waiting on a person, shown but excluded |
+
+Every measured segment belongs to one group:
+
+| Group | Categories |
+| --- | --- |
+| **Working** | model work, reads, searches, edits, other tools |
+| **Blocked** | build, tests, CI, containers, packages, sub-agents, repeated work |
+| **Excluded** | waiting on a person |
+
+A repeated build, test, or CI command is counted as repeated machine work.
+Wasted Cycles reports measured durations and actionable findings; it does not
+invent dollar savings.
+
+### Supported sources
+
+| Harness | Local trace root | Resolution |
+| --- | --- | --- |
+| Codex | `~/.codex/sessions` | event |
+| Claude Code | `~/.claude/projects` | event |
+| Cursor | `~/.cursor/projects/*/agent-transcripts` | turn |
+| Grok Build | `~/.grok/sessions` | session |
+
+Prompt text and source code are never stored, rendered, or uploaded.
 
 ## GitHub Actions
 
-Pass `github` followed by `owner/name` or a GitHub repository URL to measure the
-repository's Actions latency:
-
 ```sh
-wasted-cycles github nanoporetech/dorado
-wasted-cycles github https://github.com/nanoporetech/dorado
-wasted-cycles github --days 30 --json owner/private-repo
+wasted-cycles github OWNER/REPO
+wasted-cycles github OWNER/REPO --days 30
+wasted-cycles github --ytd --json https://github.com/OWNER/REPO
 ```
 
-Public repositories work without credentials through the GitHub REST API. When
-`gh auth status` succeeds, the command uses the GitHub CLI, which also supports
-private repositories your account can read. `GH_TOKEN` or `GITHUB_TOKEN` can be
-used instead.
+Public repositories work without login. For private repositories, authenticate
+with `gh auth login`, `GH_TOKEN`, or `GITHUB_TOKEN`.
 
-| Flag | Meaning |
-| --- | --- |
-| `--days N` | Days of workflow runs to inspect (default 7, max 365) |
-| `--ytd` | Inspect runs created since January 1 |
-| `--max-runs N` | Cap fetched workflow runs (default 1,000, max 10,000) |
-| `--json` | Print the full GitHub Actions report as JSON |
+The GitHub report shows:
 
-The headline **CI wait time** is the sum of `created_at → updated_at` for every
-completed workflow run created in the window. Queue time is included and shown
-separately. Overlapping runs are counted separately. This measures repository CI
-latency; it is not GitHub's billed runner-minutes and does not claim a person or
-agent waited for every run. Unsuccessful time is broken out so failed,
-cancelled, timed-out, and other non-successful runs are easy to see.
+- summed workflow latency across completed runs;
+- unsuccessful and queued portions;
+- median and p95 run latency;
+- success rate and the workflows using the most elapsed time.
 
-### Anonymized demo
+Workflow latency is `created_at → updated_at`. Overlapping runs count
+separately. It is repository latency—not billed runner-minutes and not proof
+that a person or agent waited for every run.
 
-This illustrative seven-day snapshot repeats a public sample **21×** (a randomly
-selected factor between 10 and 22). It preserves the sample's proportions while
-removing repository, commit, and session names.
+## Options
 
 ```text
-WASTED CYCLES · GITHUB ACTIONS
-example/repository · last 7 days · 84 completed runs
-
-CI wait time          22h 29m   summed workflow latency
-Unsuccessful time          0m   0% of CI wait
-Queue time                 0m   0% of CI wait
-Average run           16m 04s
-Success rate             100%   84 of 84 completed runs
-
-WORKFLOW SHAPE
-Build matrix          22h 06m   42 runs  ████████████████████  98.3%
-Policy checks             23m   42 runs  ▍                      1.7%
+wasted-cycles [--days N | --ytd] [--demo] [--plain | --json]
+wasted-cycles github [--days N | --ytd] [--max-runs N] [--json] OWNER/REPO
 ```
 
-These are scaled demo figures, not a claim about any repository. The live
-command always calculates from the repository and window you provide.
+Run `wasted-cycles --help` or `wasted-cycles help github` for the full, current
+reference.
 
-In the TUI, press `W` (week), `M` (month), or `Y` (YTD) — or `[` / `]` — to switch
-between **7d**, **30d**, and **YTD** without restarting. The header chips show the
-active window.
-
-The TUI is used when stdout is a terminal. Piped or redirected output falls
-back to the plain-text summary automatically, so `wasted-cycles > report.txt`
-and CI usage both behave.
-
-## How time is counted
-
-Every segment lands in one of three groups.
-
-| Group | Categories | Counted? |
-| --- | --- | --- |
-| **Agent working** | model work, read & search, code changes, other tool work | yes |
-| **Blocked on compute** | build, tests, CI, containers, packages, sub-agents, repeated work | yes — **these are the wasted cycles** |
-| **Not counted** | waiting on a human | no |
-
-`agent time` is working + blocked. `throughput` is the share of agent time that
-was not spent waiting on a machine. Human time is reported beside those numbers
-so you can see it, and excluded from both so it cannot flatter or distort them.
-
-When accelerateable waits are material, Overview and `--json` also show an
-**illustrative** recovery estimate (time + engineer $/ CI $). It applies
-conservative fractions to build, test, CI, container, package, and retry waits,
-using labelled unit rates — **not a quote or guarantee**. Options like
-[Incredibuild Build Runner](https://www.incredibuild.com/product/build-runner),
-[Blacksmith](https://www.blacksmith.sh/), and [CircleCI](https://circleci.com/)
-are listed for comparison only.
-
-A build, test, or CI command that runs more than once in a session is
-reclassified as repeated work, because the machine did the same job twice.
-
-## Supported trace roots
-
-| Harness | Local source | Resolution |
-| --- | --- | --- |
-| Codex | `~/.codex/sessions` | per event |
-| Claude Code | `~/.claude/projects` | per event |
-| Cursor | `~/.cursor/projects/*/agent-transcripts` | per turn |
-| Grok Build | `~/.grok/sessions` | per session |
-
-Wasted Cycles reads JSONL trace files modified within the selected period.
-Prompt text and source code are never stored or rendered.
-
-Cursor transcripts only stamp wall-clock time on user turns, so each segment
-spans a whole turn rather than a single tool call. Scheduled Cursor agents that
-tick on a fixed interval (the pattern that once inflated a session to 120 hours)
-are detected and dropped.
-
-## Method
+## Method and limits
 
 The profiler reconstructs elapsed segments between timestamped trace events and
-classifies each segment by the structured action that opened it: the tool that
-was called, the command that tool ran, or the message that ended a turn. It
-reads parsed event structure rather than matching text, so a pasted log or a
-quoted command in a prompt cannot be mistaken for real activity. Records it
-cannot identify are skipped instead of guessed, which leaves their elapsed time
-attributed to the last recognized action.
+classifies each segment from the structured action that opened it. It parses
+event fields rather than prompt text, so pasted logs and quoted commands are not
+treated as executed work.
 
-Idle time uses two thresholds, because a wait and a walk-away are not the same
-thing. A gap longer than 2 hours is treated as a session break and is not
-counted at all. A shorter gap is capped at 30 minutes; those segments are marked
-`"clamped": true` in JSON, carry a confidence of 0.3, and the total clamped share
-is reported on the Method screen and as `inferred_ns`, so you can see how much of
-the headline is measured versus inferred.
-
-“Model work” is an inference proxy: the interval after a user message or tool
-result and before the next emitted action. It is not claimed as GPU compute time
-unless a harness exposes exact duration. The Method screen and JSON output keep
-that limitation visible.
+A gap over two hours starts a new session and is dropped. A shorter gap is
+capped at 30 minutes, marked inferred, and exposed as `inferred_ns` in JSON.
+“Model work” is the interval after a message or tool result, not measured GPU
+time. Cursor and Grok expose coarser timestamps, so their lower-resolution
+segments are labelled in the report. Use `--json` to inspect confidence and
+segment-level details.
 
 ## Develop
 
 Requires Go 1.24 or newer.
 
 ```sh
-go test ./cmd/... ./internal/...
+go test ./...
 go run ./cmd/wasted-cycles --demo
+go run ./cmd/wasted-cycles github nanoporetech/dorado
 ```
 
-The GitHub Pages site lives in `docs/`. Release assets are built for macOS,
-Linux, and Windows by GitHub Actions on every `v*` tag.
-
-## Prior art
-
-Wasted Cycles is deliberately narrower than
-[CodeBurn](https://github.com/getagentseal/codeburn). CodeBurn explains token
-usage and cost; Wasted Cycles profiles wall-clock throughput and the machines on
-the critical path.
+The GitHub Pages source is in `docs/`. Tags matching `v*` build checksum-verified
+archives for macOS, Linux, and Windows.
 
 ## License
 
