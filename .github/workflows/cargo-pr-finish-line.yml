@@ -1,161 +1,207 @@
-name: Cargo PR finish-line validation
+name: Cargo scheduler final validation
 
 on:
   pull_request:
     branches: [main]
+    paths:
+      - .cargo-validation-trigger
 
 permissions:
   contents: read
 
 env:
-  BASE_SHA: 1e02d691ba8b99d46a664ca5af7a6bd56e1e44cf
   QUEUE_SHA: 9c8691d224960d8688e19ef310686c71490cdb05
-  CACHE_SHA: 1e31e24161755c0ce49441ebdc7eb71c833c1a29
-  ZED_SHA: 98f39bfcca6f5c1546232916f307dc062b062f64
   __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS: nightly
 
 jobs:
-  validate-cargo-prs:
+  validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Cargo PR commit
+        uses: actions/checkout@v4
         with:
           repository: zozo123/cargo
           ref: ${{ env.QUEUE_SHA }}
           fetch-depth: 0
           path: cargo-pr
-      - uses: actions/checkout@v4
-        with:
-          repository: zozo123/cargo
-          ref: ${{ env.CACHE_SHA }}
-          path: cargo-cache
-      - uses: actions/checkout@v4
-        with:
-          repository: zed-industries/zed
-          ref: ${{ env.ZED_SHA }}
-          path: zed
 
-      - name: Install Rust
+      - name: Install Cargo toolchain
         run: |
           rustup toolchain install 1.97.0 --profile minimal
           rustup component add --toolchain 1.97.0 rustfmt clippy
-          rustup toolchain install 1.95.0 --profile minimal
 
-      - name: Complete scheduler optimization
+      - name: Complete ready-work scheduler
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('cargo-pr/src/compiler/job_queue/mod.rs')
+
+          path = Path("cargo-pr/src/compiler/job_queue/mod.rs")
           source = path.read_text()
-          source = source.replace('use std::cell::RefCell;\n', 'use std::cell::RefCell;\nuse std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n', 1)
+
+          old_import = "use std::cell::RefCell;\n"
+          new_import = "use std::cell::RefCell;\nuse std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n"
+          assert source.count(old_import) == 1
+          source = source.replace(old_import, new_import, 1)
+
           marker = "pub struct JobQueue<'gctx> {\n    queue: DependencyQueue<Unit, Artifact, Job>,\n    counts: HashMap<PackageId, usize>,\n    timings: Timings<'gctx>,\n}\n\n"
-          addition = '''struct Pending<T> { value: T, priority: usize }\nimpl<T> PartialEq for Pending<T> { fn eq(&self, other: &Self) -> bool { self.priority == other.priority } }\nimpl<T> Eq for Pending<T> {}\nimpl<T> PartialOrd for Pending<T> { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }\nimpl<T> Ord for Pending<T> { fn cmp(&self, other: &Self) -> Ordering { self.priority.cmp(&other.priority) } }\n\n#[cfg(test)]\nmod pending_tests {\n    use super::Pending;\n    use std::collections::BinaryHeap;\n    #[test]\n    fn priority_and_equal_values() {\n        let mut queue = BinaryHeap::new();\n        queue.push(Pending { value: 1, priority: 1 });\n        queue.push(Pending { value: 2, priority: 3 });\n        queue.push(Pending { value: 3, priority: 1 });\n        assert_eq!(queue.pop().unwrap().value, 2);\n        let mut rest = vec![queue.pop().unwrap().value, queue.pop().unwrap().value];\n        rest.sort_unstable();\n        assert_eq!(rest, vec![1, 3]);\n    }\n}\n\n'''
-          assert marker in source
+          addition = r'''/// A job that is ready to run, ordered by Cargo's scheduling priority.
+///
+/// `order` preserves the previous sorted-`Vec` behavior for equal priorities:
+/// the job dequeued later is scheduled first.
+struct Pending<T> {
+    value: T,
+    priority: usize,
+    order: usize,
+}
+
+impl<T> PartialEq for Pending<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.order == other.order
+    }
+}
+
+impl<T> Eq for Pending<T> {}
+
+impl<T> PartialOrd for Pending<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Pending<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn pops_highest_priority_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending {
+            value: "low",
+            priority: 1,
+            order: 0,
+        });
+        queue.push(Pending {
+            value: "high",
+            priority: 3,
+            order: 1,
+        });
+        queue.push(Pending {
+            value: "middle",
+            priority: 2,
+            order: 2,
+        });
+
+        assert_eq!(queue.pop().unwrap().value, "high");
+        assert_eq!(queue.pop().unwrap().value, "middle");
+        assert_eq!(queue.pop().unwrap().value, "low");
+    }
+
+    #[test]
+    fn pops_later_equal_priority_job_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending {
+            value: "first",
+            priority: 1,
+            order: 0,
+        });
+        queue.push(Pending {
+            value: "second",
+            priority: 1,
+            order: 1,
+        });
+
+        assert_eq!(queue.pop().unwrap().value, "second");
+        assert_eq!(queue.pop().unwrap().value, "first");
+    }
+}
+
+'''
+          assert source.count(marker) == 1
           source = source.replace(marker, marker + addition, 1)
-          source = source.replace('    pending_queue: Vec<(Unit, Job, usize)>,\n', '    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,\n', 1)
-          source = source.replace('            pending_queue: Vec::new(),\n', '            pending_queue: BinaryHeap::new(),\n', 1)
-          old = '''            // We want to keep the pieces of work in the `pending_queue` sorted\n            // by their priorities, and insert the current job at its correctly\n            // sorted position: following the lower priority jobs, and the ones\n            // with the same priority (since they were dequeued before the\n            // current one, we also keep that relation).\n            let idx = self\n                .pending_queue\n                .partition_point(|&(_, _, p)| p <= priority);\n            self.pending_queue.insert(idx, (unit, job, priority));\n'''
-          new = '''            self.pending_queue.push(Pending {\n                value: (unit, job),\n                priority,\n            });\n'''
-          assert old in source
-          source = source.replace(old, new, 1)
-          source = source.replace('            let (unit, job, _) = self.pending_queue.pop().unwrap();\n', '            let Pending { value: (unit, job), .. } = self.pending_queue.pop().unwrap();\n', 1)
+
+          old_fields = "    pending_queue: Vec<(Unit, Job, usize)>,\n    print: DiagnosticPrinter<'gctx>,\n"
+          new_fields = "    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,\n    next_pending_order: usize,\n    print: DiagnosticPrinter<'gctx>,\n"
+          assert source.count(old_fields) == 1
+          source = source.replace(old_fields, new_fields, 1)
+
+          old_init = "            pending_queue: Vec::new(),\n            print: DiagnosticPrinter::new(\n"
+          new_init = "            pending_queue: BinaryHeap::new(),\n            next_pending_order: 0,\n            print: DiagnosticPrinter::new(\n"
+          assert source.count(old_init) == 1
+          source = source.replace(old_init, new_init, 1)
+
+          old_insert = r'''            // We want to keep the pieces of work in the `pending_queue` sorted
+            // by their priorities, and insert the current job at its correctly
+            // sorted position: following the lower priority jobs, and the ones
+            // with the same priority (since they were dequeued before the
+            // current one, we also keep that relation).
+            let idx = self
+                .pending_queue
+                .partition_point(|&(_, _, p)| p <= priority);
+            self.pending_queue.insert(idx, (unit, job, priority));
+'''
+          new_insert = r'''            let order = self.next_pending_order;
+            self.next_pending_order = self.next_pending_order.checked_add(1).unwrap();
+            self.pending_queue.push(Pending {
+                value: (unit, job),
+                priority,
+                order,
+            });
+'''
+          assert source.count(old_insert) == 1
+          source = source.replace(old_insert, new_insert, 1)
+
+          old_comment = r'''        // The `pending_queue` is sorted in ascending priority order, and we
+        // remove items from its end to schedule the highest priority items
+        // sooner.
+'''
+          new_comment = r'''        // The max-heap schedules the highest-priority job first.
+'''
+          assert source.count(old_comment) == 1
+          source = source.replace(old_comment, new_comment, 1)
+
+          old_pop = "            let (unit, job, _) = self.pending_queue.pop().unwrap();\n"
+          new_pop = r'''            let Pending {
+                value: (unit, job),
+                ..
+            } = self.pending_queue.pop().unwrap();
+'''
+          assert source.count(old_pop) == 1
+          source = source.replace(old_pop, new_pop, 1)
+
           path.write_text(source)
           PY
+
           cargo +1.97.0 fmt --manifest-path cargo-pr/Cargo.toml --all
           git -C cargo-pr diff --check
-          git -C cargo-pr diff > "$RUNNER_TEMP/complete-scheduler.patch"
+          git -C cargo-pr diff > "$RUNNER_TEMP/final-scheduler.patch"
 
-      - name: Test scheduler
+      - name: Test and lint
         run: |
           cargo +1.97.0 test --manifest-path cargo-pr/Cargo.toml --lib util::dependency_queue
           cargo +1.97.0 test --manifest-path cargo-pr/Cargo.toml --lib compiler::job_queue::pending_tests
-          cargo +1.97.0 clippy --manifest-path cargo-pr/Cargo.toml --lib --tests -- -D warnings
+          cargo +1.97.0 clippy --manifest-path cargo-pr/Cargo.toml --lib --tests --benches -- -D warnings
 
-      - name: Build Cargo variants
+      - name: Build optimized Cargo
         run: |
-          git -C cargo-pr worktree add ../cargo-base "$BASE_SHA"
-          for item in base:cargo-base queue:cargo-pr cache:cargo-cache; do
-            name=${item%%:*}; dir=${item#*:}
-            CARGO_TARGET_DIR="$RUNNER_TEMP/build-$name" cargo +1.97.0 build --release --locked --manifest-path "$dir/Cargo.toml" --bin cargo
-            cp "$RUNNER_TEMP/build-$name/release/cargo" "$RUNNER_TEMP/cargo-$name"
-          done
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target" \
+            cargo +1.97.0 build --release --locked \
+            --manifest-path cargo-pr/Cargo.toml --bin cargo
 
-      - name: Generate Zed graph
-        working-directory: zed
-        env:
-          RUSTUP_TOOLCHAIN: 1.95.0
-          CARGO_TARGET_DIR: ${{ runner.temp }}/zed-target
-        run: |
-          "$RUNNER_TEMP/cargo-base" fetch --locked
-          "$RUNNER_TEMP/cargo-base" check --locked -Z unstable-options --unit-graph -p zed --lib > "$RUNNER_TEMP/zed-unit-graph.json"
-
-      - name: Analyze and benchmark
-        working-directory: zed
-        env:
-          RUSTUP_TOOLCHAIN: 1.95.0
-        run: |
-          python3 - <<'PY'
-          import bisect, json, os, shutil, statistics, subprocess, time
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP'])
-          graph = json.loads((root/'zed-unit-graph.json').read_text())
-          units = graph['units']; count = len(units)
-          deps=[]; reverse=[[] for _ in range(count)]
-          for index, unit in enumerate(units):
-              current={item['index'] for item in unit.get('dependencies',[])}; deps.append(current)
-              for dependency in current: reverse[dependency].append(index)
-          memo={}; visiting=set()
-          def closure(node):
-              if node in memo: return memo[node]
-              if node in visiting: raise RuntimeError('cycle')
-              visiting.add(node); result={node}
-              for child in reverse[node]: result |= closure(child)
-              visiting.remove(node); memo[node]=result
-              return result
-          priority=[len(closure(i)) for i in range(count)]
-          remaining=[set(value) for value in deps]; nodes=set(range(count)); ready={i for i,value in enumerate(remaining) if not value}; pending=[]
-          scans=shifts=max_batch=max_pending=0
-          while nodes:
-              batch=list(ready); ready.clear(); max_batch=max(max_batch,len(batch))
-              for node in batch:
-                  scans += len(nodes); nodes.remove(node)
-                  position=bisect.bisect_right([entry[0] for entry in pending],priority[node])
-                  shifts += len(pending)-position; pending.insert(position,(priority[node],node))
-              scans += len(nodes); max_pending=max(max_pending,len(pending))
-              if not pending: raise RuntimeError('stalled')
-              _,done=pending.pop()
-              for child in reverse[done]:
-                  remaining[child].discard(done)
-                  if child in nodes and not remaining[child]: ready.add(child)
-          shape={'units':count,'edges':sum(len(value) for value in deps),'initial_ready':sum(not value for value in deps),'max_ready_batch':max_batch,'max_pending':max_pending,'baseline_scanned_entries':scans,'baseline_shifted_entries':shifts}
-          (root/'zed-shape.json').write_text(json.dumps(shape,indent=2)); print(json.dumps(shape,indent=2))
-
-          results={}
-          for name,binary in {'base':root/'cargo-base','shared':root/'cargo-cache'}.items():
-              home=root/f'home-{name}'; home.mkdir(exist_ok=True)
-              for child in ('registry','git'):
-                  source=Path.home()/'.cargo'/child; destination=home/child
-                  if source.exists() and not destination.exists(): destination.symlink_to(source,target_is_directory=True)
-              def once(index):
-                  target=root/f'probe-{name}-{index}'; shutil.rmtree(target,ignore_errors=True)
-                  env=os.environ.copy(); env['CARGO_HOME']=str(home); env['CARGO_TARGET_DIR']=str(target); env['CARGO_NET_OFFLINE']='true'
-                  started=time.perf_counter_ns()
-                  subprocess.run([str(binary),'check','--locked','--offline','-Z','unstable-options','--unit-graph','-p','zed','--lib'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env)
-                  return (time.perf_counter_ns()-started)/1e6
-              if name=='shared': once('warm')
-              samples=[once(i) for i in range(12)]
-              results[name]={'median_ms':statistics.median(samples),'mean_ms':statistics.mean(samples),'stdev_ms':statistics.stdev(samples),'samples_ms':samples}
-          (root/'probe.json').write_text(json.dumps(results,indent=2)); print(json.dumps(results,indent=2))
-          PY
-
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - name: Upload exact validated source
+        uses: actions/upload-artifact@v4
         with:
-          name: cargo-pr-finish-line
+          name: cargo-scheduler-final-source
           path: |
-            ${{ runner.temp }}/complete-scheduler.patch
-            ${{ runner.temp }}/zed-unit-graph.json
-            ${{ runner.temp }}/zed-shape.json
-            ${{ runner.temp }}/probe.json
-          if-no-files-found: warn
+            cargo-pr/src/compiler/job_queue/mod.rs
+            ${{ runner.temp }}/final-scheduler.patch
+          if-no-files-found: error
