@@ -1,0 +1,582 @@
+name: Validate Cargo scheduler PRs
+
+on:
+  push:
+    branches:
+      - bench/cargo-scheduler-pr
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: 1e02d691ba8b99d46a664ca5af7a6bd56e1e44cf
+  QUEUE_SHA: 9c8691d224960d8688e19ef310686c71490cdb05
+  CACHE_SHA: 1e31e24161755c0ce49441ebdc7eb71c833c1a29
+  ZED_SHA: 98f39bfcca6f5c1546232916f307dc062b062f64
+  CARGO_TERM_COLOR: always
+  __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS: nightly
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout benchmark harness
+        uses: actions/checkout@v4
+
+      - name: Checkout ready-queue PR
+        uses: actions/checkout@v4
+        with:
+          repository: zozo123/cargo
+          ref: ${{ env.QUEUE_SHA }}
+          fetch-depth: 0
+          path: cargo-patched
+
+      - name: Checkout shared-probe PR
+        uses: actions/checkout@v4
+        with:
+          repository: zozo123/cargo
+          ref: ${{ env.CACHE_SHA }}
+          fetch-depth: 1
+          path: cargo-cache
+
+      - name: Checkout pinned Zed
+        uses: actions/checkout@v4
+        with:
+          repository: zed-industries/zed
+          ref: ${{ env.ZED_SHA }}
+          fetch-depth: 1
+          path: zed
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt clippy
+          rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Complete the scheduler fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("cargo-patched/src/compiler/job_queue/mod.rs")
+          source = path.read_text()
+
+          source = source.replace(
+              "use std::cell::RefCell;\n",
+              "use std::cell::RefCell;\nuse std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n",
+              1,
+          )
+
+          marker = "pub struct JobQueue<'gctx> {\n    queue: DependencyQueue<Unit, Artifact, Job>,\n    counts: HashMap<PackageId, usize>,\n    timings: Timings<'gctx>,\n}\n\n"
+          replacement = marker + r'''/// A queued value ordered only by Cargo's calculated scheduling priority.
+///
+/// Equal-priority ordering was already unspecified because ready units came
+/// from hash-map iteration. Avoid requiring the queued value itself to
+/// implement `Ord`.
+struct Pending<T> {
+    value: T,
+    priority: usize,
+}
+
+impl<T> PartialEq for Pending<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl<T> Eq for Pending<T> {}
+
+impl<T> PartialOrd for Pending<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Pending<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn pops_highest_priority_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending { value: "low", priority: 1 });
+        queue.push(Pending { value: "high", priority: 3 });
+        queue.push(Pending { value: "middle", priority: 2 });
+
+        assert_eq!(queue.pop().unwrap().value, "high");
+        assert_eq!(queue.pop().unwrap().value, "middle");
+        assert_eq!(queue.pop().unwrap().value, "low");
+    }
+
+    #[test]
+    fn retains_all_equal_priority_values() {
+        let mut queue = BinaryHeap::new();
+        for value in 0..3 {
+            queue.push(Pending { value, priority: 1 });
+        }
+
+        let mut values = Vec::new();
+        while let Some(item) = queue.pop() {
+            values.push(item.value);
+        }
+        values.sort_unstable();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+}
+
+'''
+          if marker not in source:
+              raise SystemExit("JobQueue insertion marker changed")
+          source = source.replace(marker, replacement, 1)
+
+          source = source.replace(
+              "    pending_queue: Vec<(Unit, Job, usize)>,\n",
+              "    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,\n",
+              1,
+          )
+          source = source.replace(
+              "            pending_queue: Vec::new(),\n",
+              "            pending_queue: BinaryHeap::new(),\n",
+              1,
+          )
+
+          old = r'''        // Dequeue as much work as we can, learning about everything
+        // possible that can run. Note that this is also the point where we
+        // start requesting job tokens. Each job after the first needs to
+        // request a token.
+        while let Some((unit, job, priority)) = self.queue.dequeue() {
+            // We want to keep the pieces of work in the `pending_queue` sorted
+            // by their priorities, and insert the current job at its correctly
+            // sorted position: following the lower priority jobs, and the ones
+            // with the same priority (since they were dequeued before the
+            // current one, we also keep that relation).
+            let idx = self
+                .pending_queue
+                .partition_point(|&(_, _, p)| p <= priority);
+            self.pending_queue.insert(idx, (unit, job, priority));
+            if self.active.len() + self.pending_queue.len() > 1 {
+                jobserver_helper.request_token();
+            }
+        }
+
+        // Now that we've learned of all possible work that we can execute
+        // try to spawn it so long as we've got a jobserver token which says
+        // we're able to perform some parallel work.
+        // The `pending_queue` is sorted in ascending priority order, and we
+        // remove items from its end to schedule the highest priority items
+        // sooner.
+        while self.has_extra_tokens() && !self.pending_queue.is_empty() {
+            let (unit, job, _) = self.pending_queue.pop().unwrap();
+'''
+          new = r'''        // Dequeue as much work as we can, learning about everything
+        // possible that can run. Note that this is also the point where we
+        // start requesting job tokens. Each job after the first needs to
+        // request a token.
+        while let Some((unit, job, priority)) = self.queue.dequeue() {
+            self.pending_queue.push(Pending {
+                value: (unit, job),
+                priority,
+            });
+            if self.active.len() + self.pending_queue.len() > 1 {
+                jobserver_helper.request_token();
+            }
+        }
+
+        // Now that we've learned of all possible work that we can execute,
+        // spawn the highest-priority pending jobs while tokens are available.
+        while self.has_extra_tokens() && !self.pending_queue.is_empty() {
+            let Pending {
+                value: (unit, job),
+                ..
+            } = self.pending_queue.pop().unwrap();
+'''
+          if old not in source:
+              raise SystemExit("spawn_work_if_possible block changed")
+          source = source.replace(old, new, 1)
+          path.write_text(source)
+          PY
+
+          cargo +1.97.0 fmt --manifest-path cargo-patched/Cargo.toml --all
+          git -C cargo-patched diff --check
+          git -C cargo-patched diff > "$RUNNER_TEMP/complete-scheduler.patch"
+          cp cargo-patched/src/compiler/job_queue/mod.rs "$RUNNER_TEMP/job_queue_mod.rs"
+          cp cargo-patched/src/util/dependency_queue.rs "$RUNNER_TEMP/dependency_queue.rs"
+
+      - name: Validate completed scheduler change
+        run: |
+          set -euxo pipefail
+          cargo +1.97.0 test --manifest-path cargo-patched/Cargo.toml --lib util::dependency_queue
+          cargo +1.97.0 test --manifest-path cargo-patched/Cargo.toml --lib compiler::job_queue::pending_tests
+          cargo +1.97.0 clippy --manifest-path cargo-patched/Cargo.toml --lib --tests -- -D warnings
+
+      - name: Create exact base worktree
+        run: |
+          git -C cargo-patched worktree add ../cargo-base "$BASE_SHA"
+
+      - name: Build Cargo variants
+        run: |
+          set -euxo pipefail
+          target="$RUNNER_TEMP/cargo-build"
+          for spec in \
+            "base:cargo-base" \
+            "queue:cargo-patched" \
+            "cache:cargo-cache"
+          do
+            name="${spec%%:*}"
+            directory="${spec#*:}"
+            CARGO_TARGET_DIR="$target" cargo +1.97.0 build --release --locked \
+              --manifest-path "$directory/Cargo.toml" --bin cargo
+            cp "$target/release/cargo" "$RUNNER_TEMP/cargo-$name"
+            "$RUNNER_TEMP/cargo-$name" --version
+          done
+
+      - name: Fetch Zed dependencies and create unit graph
+        working-directory: zed
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+          CARGO_TARGET_DIR: ${{ runner.temp }}/zed-unit-target
+        run: |
+          set -euxo pipefail
+          "$RUNNER_TEMP/cargo-base" fetch --locked
+          "$RUNNER_TEMP/cargo-base" check --locked -Z unstable-options --unit-graph -p zed --lib \
+            > "$RUNNER_TEMP/zed-unit-graph.json"
+
+      - name: Analyze Zed scheduler shape
+        run: |
+          python3 - <<'PY'
+          import bisect
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          graph = json.loads((root / "zed-unit-graph.json").read_text())
+          units = graph["units"]
+          n = len(units)
+          deps = []
+          reverse = [[] for _ in range(n)]
+          for index, unit in enumerate(units):
+              current = {item["index"] for item in unit.get("dependencies", [])}
+              deps.append(current)
+              for dependency in current:
+                  reverse[dependency].append(index)
+
+          # Cargo's current placeholder cost is one. Its priority is the unit
+          # plus every unique transitive reverse dependency.
+          memo = {}
+          visiting = set()
+          def dependents(node):
+              if node in memo:
+                  return memo[node]
+              if node in visiting:
+                  raise RuntimeError("cycle in Zed unit graph")
+              visiting.add(node)
+              result = {node}
+              for child in reverse[node]:
+                  result.update(dependents(child))
+              visiting.remove(node)
+              memo[node] = result
+              return result
+
+          priority = [len(dependents(i)) for i in range(n)]
+          remaining_deps = [set(value) for value in deps]
+          ready = {i for i, value in enumerate(remaining_deps) if not value}
+          pending_priorities = []
+          remaining_count = n
+          completed = 0
+          max_ready_batch = 0
+          max_pending = 0
+          scanner_entries_visited = 0
+          sorted_vec_shifted_entries = 0
+          batches = []
+
+          while completed < n:
+              batch = sorted(ready, key=lambda node: priority[node], reverse=True)
+              ready.clear()
+              max_ready_batch = max(max_ready_batch, len(batch))
+              batches.append(len(batch))
+
+              # The base DependencyQueue scans every remaining unit for each
+              # successful dequeue and once more to discover no unit is ready.
+              for node in batch:
+                  scanner_entries_visited += remaining_count
+                  remaining_count -= 1
+                  insertion = bisect.bisect_right(pending_priorities, priority[node])
+                  sorted_vec_shifted_entries += len(pending_priorities) - insertion
+                  pending_priorities.insert(insertion, priority[node])
+              scanner_entries_visited += remaining_count
+              max_pending = max(max_pending, len(pending_priorities))
+
+              if not pending_priorities:
+                  raise RuntimeError("scheduler stalled")
+              next_priority = pending_priorities.pop()
+              candidates = [
+                  i for i in range(n)
+                  if i not in ready
+                  and priority[i] == next_priority
+                  and not remaining_deps[i]
+                  and all(i not in values for values in remaining_deps)
+              ]
+              # Track an explicit set of queued nodes instead of relying on the
+              # candidate fallback above.
+              # Re-run the simulation below with node identities preserved.
+              break
+
+          remaining_deps = [set(value) for value in deps]
+          ready = {i for i, value in enumerate(remaining_deps) if not value}
+          pending = []
+          remaining_nodes = set(range(n))
+          completed_order = []
+          scanner_entries_visited = 0
+          sorted_vec_shifted_entries = 0
+          max_ready_batch = 0
+          max_pending = 0
+          batches = []
+
+          while remaining_nodes:
+              batch = sorted(ready, key=lambda node: priority[node], reverse=True)
+              ready.clear()
+              max_ready_batch = max(max_ready_batch, len(batch))
+              batches.append(len(batch))
+              for node in batch:
+                  scanner_entries_visited += len(remaining_nodes)
+                  remaining_nodes.remove(node)
+                  priorities = [item[0] for item in pending]
+                  insertion = bisect.bisect_right(priorities, priority[node])
+                  sorted_vec_shifted_entries += len(pending) - insertion
+                  pending.insert(insertion, (priority[node], node))
+              scanner_entries_visited += len(remaining_nodes)
+              max_pending = max(max_pending, len(pending))
+
+              if not pending:
+                  raise RuntimeError("scheduler stalled")
+              _, finished = pending.pop()
+              completed_order.append(finished)
+              for dependent in reverse[finished]:
+                  remaining_deps[dependent].discard(finished)
+                  if not remaining_deps[dependent] and dependent in remaining_nodes:
+                      ready.add(dependent)
+
+          initial_ready = sum(1 for value in deps if not value)
+          summary = {
+              "units": n,
+              "dependency_edges": sum(len(value) for value in deps),
+              "initial_ready": initial_ready,
+              "max_ready_batch": max_ready_batch,
+              "max_pending": max_pending,
+              "ready_batches": len(batches),
+              "scanner_entries_visited": scanner_entries_visited,
+              "sorted_vec_shifted_entries": sorted_vec_shifted_entries,
+          }
+          (root / "zed-scheduler-shape.json").write_text(json.dumps(summary, indent=2))
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Benchmark shared rustc probe cache on Zed
+        working-directory: zed
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          import statistics
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          variants = {
+              "base_local_probe": root / "cargo-base",
+              "shared_probe_cache": root / "cargo-cache",
+          }
+          results = {}
+
+          for name, cargo in variants.items():
+              home = root / f"cargo-home-{name}"
+              home.mkdir(exist_ok=True)
+              for child in ("registry", "git"):
+                  source = Path.home() / ".cargo" / child
+                  destination = home / child
+                  if source.exists() and not destination.exists():
+                      destination.symlink_to(source, target_is_directory=True)
+
+              def run_once(index, measure):
+                  target = root / f"zed-probe-{name}-{index}"
+                  shutil.rmtree(target, ignore_errors=True)
+                  env = os.environ.copy()
+                  env["CARGO_HOME"] = str(home)
+                  env["CARGO_TARGET_DIR"] = str(target)
+                  env["CARGO_NET_OFFLINE"] = "true"
+                  started = time.perf_counter_ns()
+                  subprocess.run(
+                      [
+                          str(cargo), "check", "--locked", "--offline",
+                          "-Z", "unstable-options", "--unit-graph",
+                          "-p", "zed", "--lib",
+                      ],
+                      check=True,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      env=env,
+                  )
+                  elapsed = (time.perf_counter_ns() - started) / 1e6
+                  return elapsed if measure else None
+
+              # Populate the cross-workspace cache for the patched variant.
+              if name == "shared_probe_cache":
+                  run_once("warmup", False)
+
+              samples = [run_once(i, True) for i in range(20)]
+              results[name] = {
+                  "samples_ms": samples,
+                  "median_ms": statistics.median(samples),
+                  "mean_ms": statistics.mean(samples),
+                  "stdev_ms": statistics.stdev(samples),
+              }
+
+          (root / "probe-results.json").write_text(json.dumps(results, indent=2))
+          print(json.dumps(results, indent=2))
+          PY
+
+      - name: Install Zed Linux dependencies
+        working-directory: zed
+        continue-on-error: true
+        run: ./script/linux
+
+      - name: Warm and benchmark no-op Zed check
+        id: zed_benchmark
+        working-directory: zed
+        continue-on-error: true
+        env:
+          RUSTUP_TOOLCHAIN: 1.95.0
+          CARGO_TARGET_DIR: ${{ runner.temp }}/zed-build-target
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import statistics
+          import subprocess
+          import time
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          base = root / "cargo-base"
+          patched = root / "cargo-queue"
+
+          subprocess.run([str(base), "check", "--locked", "-p", "zed", "--lib"], check=True)
+
+          samples = {"base": [], "complete_heap_scheduler": []}
+          order = [
+              ("base", base),
+              ("complete_heap_scheduler", patched),
+          ] * 12
+          for name, cargo in order:
+              started = time.perf_counter_ns()
+              subprocess.run(
+                  [str(cargo), "check", "--locked", "--offline", "-p", "zed", "--lib"],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              samples[name].append((time.perf_counter_ns() - started) / 1e6)
+
+          result = {}
+          for name, values in samples.items():
+              result[name] = {
+                  "samples_ms": values,
+                  "median_ms": statistics.median(values),
+                  "mean_ms": statistics.mean(values),
+                  "stdev_ms": statistics.stdev(values),
+              }
+          (root / "zed-noop-results.json").write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+
+      - name: Build summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          lines = [
+              "# Cargo scheduler validation",
+              "",
+              f"- Cargo base: `{os.environ['BASE_SHA']}`",
+              f"- Original ready-heap PR: `{os.environ['QUEUE_SHA']}`",
+              f"- Shared probe PR: `{os.environ['CACHE_SHA']}`",
+              f"- Zed: `{os.environ['ZED_SHA']}`",
+              "",
+          ]
+
+          shape = root / "zed-scheduler-shape.json"
+          if shape.exists():
+              data = json.loads(shape.read_text())
+              lines.extend([
+                  "## Zed graph shape",
+                  "",
+                  f"- Units: **{data['units']:,}**",
+                  f"- Dependency edges: **{data['dependency_edges']:,}**",
+                  f"- Initially ready: **{data['initial_ready']:,}**",
+                  f"- Largest newly-ready batch: **{data['max_ready_batch']:,}**",
+                  f"- Maximum pending jobs: **{data['max_pending']:,}**",
+                  f"- Baseline dependency-map entries inspected: **{data['scanner_entries_visited']:,}**",
+                  f"- Baseline sorted-Vec entries shifted: **{data['sorted_vec_shifted_entries']:,}**",
+                  "",
+              ])
+
+          for title, filename in [
+              ("Fresh Zed build-directory probe", "probe-results.json"),
+              ("Warm no-op Zed check", "zed-noop-results.json"),
+          ]:
+              lines.extend([f"## {title}", ""])
+              path = root / filename
+              if not path.exists():
+                  lines.extend(["Did not complete.", ""])
+                  continue
+              data = json.loads(path.read_text())
+              lines.extend([
+                  "| Variant | Median | Mean | Stddev |",
+                  "|---|---:|---:|---:|",
+              ])
+              for name, values in data.items():
+                  lines.append(
+                      f"| `{name}` | {values['median_ms']:.2f} ms | "
+                      f"{values['mean_ms']:.2f} ms | {values['stdev_ms']:.2f} ms |"
+                  )
+              lines.append("")
+
+          summary = "\n".join(lines)
+          (root / "summary.md").write_text(summary)
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as handle:
+              handle.write(summary)
+          PY
+
+      - name: Upload evidence and completed patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-scheduler-validation
+          path: |
+            ${{ runner.temp }}/complete-scheduler.patch
+            ${{ runner.temp }}/job_queue_mod.rs
+            ${{ runner.temp }}/dependency_queue.rs
+            ${{ runner.temp }}/zed-unit-graph.json
+            ${{ runner.temp }}/zed-scheduler-shape.json
+            ${{ runner.temp }}/probe-results.json
+            ${{ runner.temp }}/zed-noop-results.json
+            ${{ runner.temp }}/summary.md
+          if-no-files-found: warn
