@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Wasted Cycles — Wall-clock profiler for coding agents</title>
+    <meta name="description" content="See where Codex, Claude Code, Cursor, and Grok Build runs spend time outside model reasoning.">
+    <meta property="og:title" content="Wasted Cycles">
+    <meta property="og:description" content="Find where coding-agent runs stop coding.">
+    <meta property="og:image" content="https://zozo123.github.io/wasted-cycles/og.png">
+    <meta property="og:url" content="https://zozo123.github.io/wasted-cycles/">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="Wasted Cycles">
+    <meta name="twitter:description" content="Find where coding-agent runs stop coding.">
+    <meta name="twitter:image" content="https://zozo123.github.io/wasted-cycles/og.png">
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <nav class="nav shell">
+        <a class="brand" href="#top" aria-label="Wasted Cycles home"><span>WASTED</span> CYCLES</a>
+        <div class="nav-links"><a href="#method">Method</a><a href="https://github.com/zozo123/wasted-cycles">GitHub ↗</a></div>
+      </nav>
+
+      <section class="hero shell" id="top">
+        <div class="hero-copy">
+          <p class="eyebrow">LOCAL WALL-CLOCK PROFILER FOR CODING AGENTS</p>
+          <h1>Your agents are fast.<br><em>Your harness is not.</em></h1>
+          <p class="lede">See how much run time goes to actual model work—and how much disappears into CI, retries, tool stalls, sub-agent joins, and waiting for you.</p>
+          <div class="command-wrap">
+            <code>curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh</code>
+            <button class="copy-command" type="button" aria-label="Copy run command">COPY</button>
+          </div>
+          <p class="trust-line">No install <i></i> No account <i></i> No upload <i></i> Deletes itself after exit</p>
+        </div>
+
+        <div class="terminal" aria-label="Wasted Cycles terminal report preview">
+          <div class="terminal-bar"><div><i></i><i></i><i></i></div><span>wasted-cycles — overview</span><b>⌁</b></div>
+          <div class="terminal-body">
+            <div class="term-brand"><span>WASTED</span> CYCLES <small>last 7d · 84 traces</small></div>
+            <div class="term-tabs"><b>1 OVERVIEW</b><span>2 HISTOGRAM</span><span>3 RUNS</span><span>4 METHOD</span></div>
+            <div class="metrics">
+              <div><small>OBSERVED</small><strong>4h 36m</strong></div>
+              <div><small>REASONING</small><strong class="purple-text">23%</strong></div>
+              <div><small>RECOVERABLE</small><strong class="red-text">1h 08m</strong></div>
+              <div><small>THROUGHPUT</small><strong class="lime-text">75%</strong></div>
+            </div>
+            <p class="term-title">WHERE THE TIME WENT <span>7 classified buckets</span></p>
+            <div class="bars">
+              <div class="bar-row"><span>Model work</span><div><i class="purple" style="width:91%"></i></div><b>1h 04m</b></div>
+              <div class="bar-row"><span>Code changes</span><div><i class="lime" style="width:100%"></i></div><b>1h 10m</b></div>
+              <div class="bar-row"><span>Read &amp; search</span><div><i class="blue" style="width:49%"></i></div><b>34m</b></div>
+              <div class="bar-row"><span>Local verify</span><div><i class="teal" style="width:57%"></i></div><b>40m</b></div>
+              <div class="bar-row"><span>Waiting for CI</span><div><i class="orange" style="width:34%"></i></div><b>24m</b></div>
+              <div class="bar-row"><span>Waiting for human</span><div><i class="red" style="width:24%"></i></div><b>17m</b></div>
+              <div class="bar-row"><span>Retries</span><div><i class="rose" style="width:11%"></i></div><b>8m</b></div>
+            </div>
+            <div class="terminal-finding"><span>BIGGEST LEAK</span><strong>CI feedback · 24m on the critical path</strong><small>Split independent checks and mirror the slow gate locally.</small></div>
+            <div class="term-footer">←/→ switch view <span>local only · no uploads</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="harnesses">
+        <div class="shell harness-row" aria-label="Supported coding agents">
+          <span>READS THE TRACES YOU ALREADY HAVE</span><strong>CODEX</strong><strong>CLAUDE CODE</strong><strong>CURSOR</strong><strong>GROK BUILD</strong>
+        </div>
+      </section>
+
+      <section class="thesis shell" id="method">
+        <p class="section-kicker">THE THROUGHPUT QUESTION</p>
+        <h2>Tokens tell you what you spent.<br><span>Time tells you why you waited.</span></h2>
+        <div class="thesis-grid">
+          <p>Wasted Cycles reconstructs the critical path from timestamped local trace events. It separates reasoning, exploration, edits, and verification from recoverable waits and repeated work.</p>
+          <div class="formula"><span>THROUGHPUT</span><strong>productive observed time</strong><b>÷</b><strong>total observed time</strong></div>
+        </div>
+      </section>
+
+      <section class="steps shell">
+        <article><span>01</span><h3>Read locally</h3><p>Find recent traces across four harnesses. Prompts and code never leave your machine.</p></article>
+        <article><span>02</span><h3>Rebuild the clock</h3><p>Turn emitted events into an honest histogram of where wall-clock time went.</p></article>
+        <article><span>03</span><h3>Fix the biggest leak</h3><p>Rank the critical-path bottlenecks by recoverable time, with a concrete next move.</p></article>
+      </section>
+
+      <section class="honesty shell">
+        <div><p class="section-kicker">BUILT FOR TRUST</p><h2>Precise where possible.<br>Explicit where inferred.</h2></div>
+        <div class="honesty-copy"><p>Agent trace formats expose different timing detail. “Model work” is labeled as an inference proxy unless the harness records exact duration. Offline gaps are capped. Every classification is auditable through JSON.</p><a href="https://github.com/zozo123/wasted-cycles#method">Read the method →</a></div>
+      </section>
+
+      <section class="final-cta"><div class="shell"><p class="section-kicker">ONE COMMAND. ONE ANSWER.</p><h2>Where did the run stop moving?</h2><div class="command-wrap compact"><code>curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run | sh</code><button class="copy-command" type="button">COPY</button></div></div></section>
+      <footer class="shell"><a class="brand" href="#top"><span>WASTED</span> CYCLES</a><p>Open source · MIT · Runs entirely on your machine</p><a href="https://github.com/zozo123/wasted-cycles">Star on GitHub ↗</a></footer>
+    </main>
+  </body>
+</html>

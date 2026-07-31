@@ -66,7 +66,7 @@ that limitation visible.
 
 ## Develop
 
-Requires Go 1.23 or newer.
+Requires Go 1.24 or newer.
 
 ```sh
 go test ./cmd/... ./internal/...

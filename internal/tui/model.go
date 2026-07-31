@@ -94,8 +94,10 @@ func (m Model) View() string {
 	}
 
 	header := m.header(bodyWidth)
-	footer := lipgloss.NewStyle().Foreground(muted).Width(bodyWidth).Render(
-		"←/→ switch view   1–4 jump   q quit" + strings.Repeat(" ", max(1, bodyWidth-47)) + "local only · no uploads",
+	footerLeft := "←/→ switch view   1–4 jump   q quit"
+	footerRight := "local only · no uploads"
+	footer := lipgloss.NewStyle().Foreground(muted).Render(
+		footerLeft + strings.Repeat(" ", max(1, bodyWidth-lipgloss.Width(footerLeft)-lipgloss.Width(footerRight))) + footerRight,
 	)
 	page := lipgloss.JoinVertical(lipgloss.Left, header, "", body, "", footer)
 	return lipgloss.NewStyle().MarginLeft(2).MarginTop(1).Render(page)
@@ -149,8 +151,12 @@ func (m Model) overview(width int) string {
 
 func (m Model) histogram(width int) string {
 	title := sectionTitle("WHERE THE TIME WENT", fmt.Sprintf("%d classified buckets", len(m.report.Categories)))
+	categories := sortedCategories(m.report)
+	if len(categories) > 6 {
+		categories = categories[:6]
+	}
 	maxDuration := time.Duration(0)
-	for _, category := range m.report.Categories {
+	for _, category := range categories {
 		if category.Duration > maxDuration {
 			maxDuration = category.Duration
 		}
@@ -158,7 +164,7 @@ func (m Model) histogram(width int) string {
 	labelWidth := min(18, max(13, width/3))
 	barWidth := max(8, width-labelWidth-13)
 	lines := []string{title, ""}
-	for _, category := range m.report.Categories {
+	for _, category := range categories {
 		ratio := float64(category.Duration) / float64(maxDuration)
 		fill := int(math.Round(ratio * float64(barWidth)))
 		color := categoryColor(category.ID)
@@ -168,9 +174,7 @@ func (m Model) histogram(width int) string {
 		value := lipgloss.NewStyle().Width(9).Align(lipgloss.Right).Foreground(color).Bold(true).Render(duration(category.Duration))
 		lines = append(lines, label+" "+bar+" "+value)
 	}
-	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render(
-		"Time between timestamped trace events · idle gaps capped at 30m",
-	))
+	lines = append(lines, "", lipgloss.NewStyle().Foreground(muted).Render("Full distribution → Histogram"))
 	return strings.Join(lines, "\n")
 }
 
@@ -306,7 +310,7 @@ func statCard(width int, label, value, note string, color lipgloss.Color) string
 	)
 	return lipgloss.NewStyle().
 		Width(width-1).
-		Height(4).
+		Height(3).
 		Padding(0, 1).
 		MarginRight(1).
 		Background(panel).
@@ -316,7 +320,7 @@ func statCard(width int, label, value, note string, color lipgloss.Color) string
 }
 
 func panelStyle(width int) lipgloss.Style {
-	return lipgloss.NewStyle().Width(width).Padding(1, 2).Background(panel)
+	return lipgloss.NewStyle().Width(width).Padding(0, 1).Background(panel)
 }
 
 func sectionTitle(title, note string) string {
@@ -355,7 +359,7 @@ func legend(width int) string {
 		id, label string
 	}{
 		{"reasoning", "model"}, {"explore", "read"}, {"edit", "edit"},
-		{"verify", "test"}, {"ci_wait", "CI"}, {"human_wait", "human"},
+		{"verify", "test"}, {"tool", "tools"}, {"ci_wait", "CI"}, {"human_wait", "human"},
 		{"agent_wait", "agents"}, {"retry", "retry"},
 	}
 	var rendered []string
@@ -378,6 +382,8 @@ func categoryColor(category string) lipgloss.Color {
 		return lime
 	case "verify":
 		return teal
+	case "tool":
+		return lipgloss.Color("#9CA3AF")
 	case "ci_wait":
 		return orange
 	case "agent_wait":

@@ -92,7 +92,7 @@ type event struct {
 }
 
 var categoryOrder = []string{
-	"reasoning", "explore", "edit", "verify", "ci_wait",
+	"reasoning", "explore", "edit", "verify", "tool", "ci_wait",
 	"agent_wait", "human_wait", "dependency_wait", "retry", "unknown",
 }
 
@@ -101,6 +101,7 @@ var categoryLabels = map[string]string{
 	"explore":         "Read & search",
 	"edit":            "Code changes",
 	"verify":          "Local verify",
+	"tool":            "Other tool work",
 	"ci_wait":         "Waiting for CI",
 	"agent_wait":      "Waiting for agents",
 	"human_wait":      "Waiting for human",
@@ -264,9 +265,14 @@ func readEvents(file candidate) ([]event, string) {
 			if json.Unmarshal(line, &value) == nil {
 				at := findTime(value)
 				if !at.IsZero() {
-					flat := strings.ToLower(flatten(value, 0))
+					flat := strings.ToLower(flatten(value, 0, ""))
 					category, label, key := classify(flat)
-					events = append(events, event{At: at, Category: category, Label: label, Key: key})
+					if category == "unknown" && os.Getenv("WASTED_CYCLES_DEBUG") != "" {
+						fmt.Fprintln(os.Stderr, "unclassified:", flat)
+					}
+					if category != "meta" {
+						events = append(events, event{At: at, Category: category, Label: label, Key: key})
+					}
 				}
 				if project == "" {
 					project = findString(value, "cwd", "projectPath", "workspace", "project")
@@ -282,24 +288,34 @@ func readEvents(file candidate) ([]event, string) {
 
 func classify(flat string) (string, string, string) {
 	switch {
+	case containsAny(flat, "token_count", "session_meta", "turn_context", "world_state", "thread_settings_applied", "task_started", "role:developer", "role:system"):
+		return "meta", "trace metadata", ""
 	case containsAny(flat, "wait_agent", "wait agent", "waiting on agent", "join agents"):
 		return "agent_wait", "agent join", ""
+	case containsAny(flat, "retry_state", "type:retrying"):
+		return "retry", "harness retry", ""
 	case containsAny(flat, "gh run watch", "gh pr checks --watch", "waiting for ci", "github actions", "buildkite-agent", "circleci"):
 		return "ci_wait", "CI feedback", commandKey(flat)
 	case containsAny(flat, "go test", "cargo test", "pytest", "npm test", "pnpm test", "yarn test", "vitest", "jest", "rspec", "mvn test", "gradle test"):
 		return "verify", "test suite", commandKey(flat)
-	case containsAny(flat, "apply_patch", "write_file", "edit_file", "str_replace", "search_replace", "\"name\":\"edit", "\"name\": \"edit"):
+	case containsAny(flat, "apply_patch", "patch_apply", "write_file", "edit_file", "str_replace", "search_replace", "\"name\":\"edit", "\"name\": \"edit"):
 		return "edit", "code change", ""
 	case containsAny(flat, "read_file", "list_dir", "\"name\":\"read", "\"name\": \"read", "\"name\":\"grep", "\"name\": \"grep", "search_query", "glob"):
 		return "explore", "read / search", ""
 	case containsAny(flat, "npm install", "pnpm install", "yarn install", "cargo fetch", "go mod download", "pip install", "curl ", "wget "):
 		return "dependency_wait", "dependency / network", commandKey(flat)
-	case containsAny(flat, "\"role\":\"assistant", "\"role\": \"assistant", "agent_message", "final_answer"):
+	case containsAny(flat, "\"role\":\"assistant", "\"role\": \"assistant", "role:assistant", "agent_message", "final_answer"):
 		return "human_wait", "handoff to human", ""
-	case containsAny(flat, "\"role\":\"user", "\"role\": \"user", "user_message", "tool_result", "function_call_output"):
+	case containsAny(flat, "sessionupdate:turn_completed"):
+		return "human_wait", "turn complete", ""
+	case containsAny(flat, "\"role\":\"user", "\"role\": \"user", "role:user", "user_message", "tool_result", "function_call_output"):
 		return "reasoning", "model response", ""
-	case containsAny(flat, "function_call", "tool_use", "tool_call"):
-		return "reasoning", "tool planning", ""
+	case containsAny(flat, "custom_tool_call_output", "tool_search_output", "mcp_tool_call_end", "web_search_end", "image_generation_end", "type:reasoning", "agent_thought_chunk", "sessionupdate:plan", "session_recap"):
+		return "reasoning", "model response", ""
+	case containsAny(flat, "sessionupdate:task_completed"):
+		return "tool", "tool execution", commandKey(flat)
+	case containsAny(flat, "custom_tool_call", "function_call", "tool_use", "tool_call", "write_stdin", "tool_search_call"):
+		return "tool", "tool execution", commandKey(flat)
 	default:
 		return "unknown", "unclassified event", ""
 	}
@@ -355,7 +371,7 @@ func unixTime(value int64) time.Time {
 	return time.UnixMilli(value)
 }
 
-func flatten(value any, depth int) string {
+func flatten(value any, depth int, parentKey string) string {
 	if depth > 7 {
 		return ""
 	}
@@ -365,18 +381,21 @@ func flatten(value any, depth int) string {
 		for key, child := range v {
 			builder.WriteString(key)
 			builder.WriteByte(':')
-			builder.WriteString(flatten(child, depth+1))
+			builder.WriteString(flatten(child, depth+1, key))
 			builder.WriteByte(' ')
 		}
 		return builder.String()
 	case []any:
 		var builder strings.Builder
 		for _, child := range v {
-			builder.WriteString(flatten(child, depth+1))
+			builder.WriteString(flatten(child, depth+1, parentKey))
 			builder.WriteByte(' ')
 		}
 		return builder.String()
 	case string:
+		if !classificationField(parentKey) {
+			return ""
+		}
 		if len(v) > 800 {
 			return v[:800]
 		}
@@ -385,6 +404,15 @@ func flatten(value any, depth int) string {
 		return fmt.Sprint(v)
 	default:
 		return ""
+	}
+}
+
+func classificationField(key string) bool {
+	switch strings.ToLower(key) {
+	case "type", "role", "name", "command", "cmd", "title", "sessionupdate", "tool", "function", "arguments", "input", "rawinput":
+		return true
+	default:
+		return false
 	}
 }
 

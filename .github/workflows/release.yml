@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build release assets
+        env:
+          VERSION: ${{ github.ref_name }}
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          mkdir -p release
+          for target in \
+            darwin/arm64 darwin/amd64 \
+            linux/arm64 linux/amd64 \
+            windows/arm64 windows/amd64
+          do
+            os="${target%/*}"
+            arch="${target#*/}"
+            display_arch="$arch"
+            [ "$display_arch" = "amd64" ] && display_arch="x86_64"
+            name="wasted-cycles_${os}_${display_arch}"
+            binary="wasted-cycles"
+            [ "$os" = "windows" ] && binary="wasted-cycles.exe"
+            GOOS="$os" GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "release/$binary" ./cmd/wasted-cycles
+            if [ "$os" = "windows" ]; then
+              (cd release && zip -q "${name}.zip" "$binary")
+            else
+              (cd release && tar -czf "${name}.tar.gz" "$binary")
+            fi
+            rm "release/$binary"
+          done
+          (cd release && sha256sum *.tar.gz *.zip > checksums.txt)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" release/* \
+            --repo "${{ github.repository }}" \
+            --title "Wasted Cycles ${{ github.ref_name }}" \
+            --generate-notes
