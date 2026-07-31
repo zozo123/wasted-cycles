@@ -8,7 +8,8 @@ A wasted cycle is time your agent spends blocked on compute it does not
 control — compiling, running tests, waiting on CI, provisioning containers,
 fetching packages, joining sub-agents. Wasted Cycles reads the traces already on
 your machine and shows you how much of a run was that, and which machine to fix
-first.
+first. It can also inspect a GitHub repository and total the wall-clock time
+spent in GitHub Actions.
 
 Time spent waiting on a *person* is not a wasted cycle. It is reported
 separately and never enters the metric.
@@ -29,6 +30,7 @@ or upload.
 - Which coding harness keeps moving on your workload?
 - What is the highest-impact bottleneck to fix next?
 - Roughly how much time and money those waits might be worth to recover?
+- How much wall-clock time did this repository spend in GitHub Actions?
 
 Use the arrow keys to switch between Overview, Histogram, Runs, and Method.
 Press `W`, `M`, or `Y` to switch the lookback window. Press `q` to quit.
@@ -49,6 +51,14 @@ curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
 # Machine-readable output
 curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
   sh -s -- --json
+
+# Analyze GitHub Actions for a public repository
+curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
+  sh -s -- github nanoporetech/dorado
+
+# The repository can also be a URL; flags come before it
+curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
+  sh -s -- github --days 30 --json https://github.com/nanoporetech/dorado
 ```
 
 | Flag | Meaning |
@@ -60,6 +70,60 @@ curl -fsSL https://raw.githubusercontent.com/zozo123/wasted-cycles/main/run |
 | `--plain` | Print a plain-text summary instead of the TUI |
 | `--no-alt-screen` | Render without the terminal alternate screen |
 | `--version` | Print the version |
+
+## GitHub Actions
+
+Pass `github` followed by `owner/name` or a GitHub repository URL to measure the
+repository's Actions latency:
+
+```sh
+wasted-cycles github nanoporetech/dorado
+wasted-cycles github https://github.com/nanoporetech/dorado
+wasted-cycles github --days 30 --json owner/private-repo
+```
+
+Public repositories work without credentials through the GitHub REST API. When
+`gh auth status` succeeds, the command uses the GitHub CLI, which also supports
+private repositories your account can read. `GH_TOKEN` or `GITHUB_TOKEN` can be
+used instead.
+
+| Flag | Meaning |
+| --- | --- |
+| `--days N` | Days of workflow runs to inspect (default 7, max 365) |
+| `--ytd` | Inspect runs created since January 1 |
+| `--max-runs N` | Cap fetched workflow runs (default 1,000, max 10,000) |
+| `--json` | Print the full GitHub Actions report as JSON |
+
+The headline **CI wait time** is the sum of `created_at → updated_at` for every
+completed workflow run created in the window. Queue time is included and shown
+separately. Overlapping runs are counted separately. This measures repository CI
+latency; it is not GitHub's billed runner-minutes and does not claim a person or
+agent waited for every run. Unsuccessful time is broken out so failed,
+cancelled, timed-out, and other non-successful runs are easy to see.
+
+### Anonymized demo
+
+This illustrative seven-day snapshot repeats a public sample **21×** (a randomly
+selected factor between 10 and 22). It preserves the sample's proportions while
+removing repository, commit, and session names.
+
+```text
+WASTED CYCLES · GITHUB ACTIONS
+example/repository · last 7 days · 84 completed runs
+
+CI wait time          22h 29m   summed workflow latency
+Unsuccessful time          0m   0% of CI wait
+Queue time                 0m   0% of CI wait
+Average run           16m 04s
+Success rate             100%   84 of 84 completed runs
+
+WORKFLOW SHAPE
+Build matrix          22h 06m   42 runs  ████████████████████  98.3%
+Policy checks             23m   42 runs  ▍                      1.7%
+```
+
+These are scaled demo figures, not a claim about any repository. The live
+command always calculates from the repository and window you provide.
 
 In the TUI, press `W` (week), `M` (month), or `Y` (YTD) — or `[` / `]` — to switch
 between **7d**, **30d**, and **YTD** without restarting. The header chips show the
