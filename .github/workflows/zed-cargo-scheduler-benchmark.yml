@@ -1,0 +1,407 @@
+name: Zed Cargo scheduler benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/zed-cargo-scheduler-benchmark.yml
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      CARGO_BASE_SHA: 8ea62e927ca2875b7839b8c5110f3e4fdfdf58c3
+      CARGO_HEAD_SHA: b1941b55d1b1a311c6a20b93ada622267c3d35b3
+      ZED_SHA: 5e03f2d387e629237c10a4e4fed881b64abd8fea
+      RUST_BACKTRACE: 1
+      CARGO_TERM_COLOR: never
+
+    steps:
+      - name: Record system and free disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/results" "$RUNNER_TEMP/bin"
+          {
+            echo "date_utc=$(date -u +%FT%TZ)"
+            echo "runner=${RUNNER_NAME:-unknown}"
+            echo "os=$(uname -a)"
+            echo "cpus=$(nproc)"
+            echo "memory_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
+            lscpu
+            df -h
+          } | tee "$RUNNER_TEMP/results/system.txt"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          sudo apt-get clean
+          df -h | tee -a "$RUNNER_TEMP/results/system.txt"
+
+      - name: Install Zed build dependencies and Rust toolchains
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/zed"
+          cd "$RUNNER_TEMP/zed"
+          git remote add origin https://github.com/zed-industries/zed.git
+          git fetch --depth 1 origin "$ZED_SHA"
+          git checkout --detach FETCH_HEAD
+          ./script/linux
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup run 1.97.0 rustc --version --verbose | tee "$RUNNER_TEMP/results/rust-1.97.txt"
+          rustup run 1.95.0 rustc --version --verbose | tee "$RUNNER_TEMP/results/rust-1.95.txt"
+
+      - name: Build exact Cargo base and PR binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git init "$RUNNER_TEMP/cargo-src"
+          cd "$RUNNER_TEMP/cargo-src"
+          git remote add upstream https://github.com/rust-lang/cargo.git
+          git remote add fork https://github.com/zozo123/cargo.git
+          git fetch --depth 1 upstream "$CARGO_BASE_SHA"
+          git branch cargo-base FETCH_HEAD
+          git fetch --depth 1 fork "$CARGO_HEAD_SHA"
+          git branch cargo-head FETCH_HEAD
+          git worktree add --detach "$RUNNER_TEMP/cargo-base" cargo-base
+          git worktree add --detach "$RUNNER_TEMP/cargo-head" cargo-head
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-base-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-base/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-base-target/release/cargo" "$RUNNER_TEMP/bin/cargo-base"
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-head-target" \
+            cargo +1.97.0 build --release --locked --bin cargo \
+            --manifest-path "$RUNNER_TEMP/cargo-head/Cargo.toml"
+          cp "$RUNNER_TEMP/cargo-head-target/release/cargo" "$RUNNER_TEMP/bin/cargo-head"
+          chmod +x "$RUNNER_TEMP/bin/cargo-base" "$RUNNER_TEMP/bin/cargo-head"
+
+          "$RUNNER_TEMP/bin/cargo-base" --version --verbose | tee "$RUNNER_TEMP/results/cargo-base-version.txt"
+          "$RUNNER_TEMP/bin/cargo-head" --version --verbose | tee "$RUNNER_TEMP/results/cargo-head-version.txt"
+          sha256sum "$RUNNER_TEMP/bin/cargo-base" "$RUNNER_TEMP/bin/cargo-head" | tee "$RUNNER_TEMP/results/cargo-binaries.sha256"
+
+          rm -rf "$RUNNER_TEMP/cargo-base-target" "$RUNNER_TEMP/cargo-head-target" \
+                 "$RUNNER_TEMP/cargo-base" "$RUNNER_TEMP/cargo-head" "$RUNNER_TEMP/cargo-src"
+          df -h | tee -a "$RUNNER_TEMP/results/system.txt"
+
+      - name: Resolve dependencies and characterize Zed unit graph
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/zed-target"
+          "$RUNNER_TEMP/bin/cargo-base" fetch --locked
+          "$RUNNER_TEMP/bin/cargo-base" check -p zed --locked --unit-graph > "$RUNNER_TEMP/results/unit-graph.json"
+          python3 - <<'PY'
+          import json, os
+          p = os.path.join(os.environ['RUNNER_TEMP'], 'results', 'unit-graph.json')
+          with open(p) as f:
+              data = json.load(f)
+          units = data.get('units', [])
+          initial_ready = sum(1 for u in units if not u.get('dependencies', []))
+          dep_edges = sum(len(u.get('dependencies', [])) for u in units)
+          profiles = {}
+          modes = {}
+          kinds = {}
+          for u in units:
+              profile = u.get('profile', {})
+              pname = profile.get('name', 'unknown') if isinstance(profile, dict) else str(profile)
+              profiles[pname] = profiles.get(pname, 0) + 1
+              mode = str(u.get('mode', 'unknown'))
+              modes[mode] = modes.get(mode, 0) + 1
+              kind = str(u.get('target', {}).get('kind', 'unknown'))
+              kinds[kind] = kinds.get(kind, 0) + 1
+          out = {
+              'zed_sha': os.environ['ZED_SHA'],
+              'cargo_base_sha': os.environ['CARGO_BASE_SHA'],
+              'cargo_head_sha': os.environ['CARGO_HEAD_SHA'],
+              'units': len(units),
+              'initially_ready_units': initial_ready,
+              'dependency_edges': dep_edges,
+              'profiles': profiles,
+              'modes': modes,
+              'target_kinds': kinds,
+          }
+          outp = os.path.join(os.environ['RUNNER_TEMP'], 'results', 'unit-graph-summary.json')
+          with open(outp, 'w') as f:
+              json.dump(out, f, indent=2, sort_keys=True)
+          print(json.dumps(out, indent=2, sort_keys=True))
+          PY
+          gzip -9 "$RUNNER_TEMP/results/unit-graph.json"
+
+      - name: Prime Zed check target
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          export RUSTUP_TOOLCHAIN=1.95.0
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/zed-target"
+          /usr/bin/time -v -o "$RUNNER_TEMP/results/prime-time.txt" \
+            "$RUNNER_TEMP/bin/cargo-base" check -p zed --locked
+          "$RUNNER_TEMP/bin/cargo-base" check -q -p zed --locked
+          "$RUNNER_TEMP/bin/cargo-head" check -q -p zed --locked
+          "$RUNNER_TEMP/bin/cargo-base" check -q -p zed --locked
+          "$RUNNER_TEMP/bin/cargo-head" check -q -p zed --locked
+          df -h | tee -a "$RUNNER_TEMP/results/system.txt"
+
+      - name: Benchmark alternating warm no-op checks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import csv, json, os, random, statistics, subprocess, time
+
+          root = os.environ['RUNNER_TEMP']
+          zed = os.path.join(root, 'zed')
+          results = os.path.join(root, 'results')
+          bins = {
+              'base': os.path.join(root, 'bin', 'cargo-base'),
+              'head': os.path.join(root, 'bin', 'cargo-head'),
+          }
+          env = os.environ.copy()
+          env.update({
+              'RUSTUP_TOOLCHAIN': '1.95.0',
+              'CARGO_TARGET_DIR': os.path.join(root, 'zed-target'),
+              'CARGO_NET_OFFLINE': 'true',
+              'CARGO_TERM_COLOR': 'never',
+          })
+          rows = []
+          blocks = 25
+          for block in range(blocks):
+              order = ('base', 'head') if block % 2 == 0 else ('head', 'base')
+              for position, variant in enumerate(order):
+                  start = time.perf_counter_ns()
+                  proc = subprocess.run(
+                      [bins[variant], 'check', '-q', '-p', 'zed', '--locked'],
+                      cwd=zed, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      text=True,
+                  )
+                  elapsed_ms = (time.perf_counter_ns() - start) / 1_000_000
+                  if proc.returncode != 0:
+                      raise SystemExit(f'{variant} failed: {proc.stderr[-4000:]}')
+                  rows.append({
+                      'block': block,
+                      'position': position,
+                      'variant': variant,
+                      'elapsed_ms': elapsed_ms,
+                      'stdout_bytes': len(proc.stdout.encode()),
+                      'stderr_bytes': len(proc.stderr.encode()),
+                  })
+                  print(f'block={block:02d} position={position} variant={variant} elapsed_ms={elapsed_ms:.3f}')
+
+          with open(os.path.join(results, 'wall-runs.csv'), 'w', newline='') as f:
+              w = csv.DictWriter(f, fieldnames=rows[0].keys())
+              w.writeheader(); w.writerows(rows)
+
+          values = {v: [r['elapsed_ms'] for r in rows if r['variant'] == v] for v in bins}
+          paired = []
+          for block in range(blocks):
+              br = {r['variant']: r['elapsed_ms'] for r in rows if r['block'] == block}
+              paired.append(br['base'] - br['head'])
+
+          def percentile(xs, p):
+              ys = sorted(xs)
+              k = (len(ys) - 1) * p
+              lo = int(k); hi = min(lo + 1, len(ys) - 1)
+              return ys[lo] + (ys[hi] - ys[lo]) * (k - lo)
+
+          random.seed(17281)
+          boot = []
+          for _ in range(20000):
+              sample = [paired[random.randrange(len(paired))] for _ in paired]
+              boot.append(statistics.mean(sample))
+
+          summary = {}
+          for variant, xs in values.items():
+              summary[variant] = {
+                  'n': len(xs),
+                  'mean_ms': statistics.mean(xs),
+                  'median_ms': statistics.median(xs),
+                  'stdev_ms': statistics.stdev(xs),
+                  'min_ms': min(xs),
+                  'p95_ms': percentile(xs, 0.95),
+                  'max_ms': max(xs),
+              }
+          base_med = summary['base']['median_ms']
+          head_med = summary['head']['median_ms']
+          summary['comparison'] = {
+              'median_difference_ms_base_minus_head': base_med - head_med,
+              'median_improvement_percent': (base_med - head_med) / base_med * 100,
+              'median_speedup_ratio': base_med / head_med,
+              'paired_mean_difference_ms_base_minus_head': statistics.mean(paired),
+              'paired_mean_difference_95ci_ms': [percentile(boot, 0.025), percentile(boot, 0.975)],
+          }
+          with open(os.path.join(results, 'wall-summary.json'), 'w') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Capture Cargo internal profiler traces
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$RUNNER_TEMP/zed"
+          python3 - <<'PY'
+          import csv, glob, json, os, subprocess, time
+
+          root = os.environ['RUNNER_TEMP']
+          zed = os.path.join(root, 'zed')
+          results = os.path.join(root, 'results')
+          bins = {
+              'base': os.path.join(root, 'bin', 'cargo-base'),
+              'head': os.path.join(root, 'bin', 'cargo-head'),
+          }
+          env = os.environ.copy()
+          env.update({
+              'RUSTUP_TOOLCHAIN': '1.95.0',
+              'CARGO_TARGET_DIR': os.path.join(root, 'zed-target'),
+              'CARGO_NET_OFFLINE': 'true',
+              'CARGO_TERM_COLOR': 'never',
+              'CARGO_LOG_PROFILE': '1',
+          })
+          rows = []
+          for block in range(7):
+              order = ('base', 'head') if block % 2 == 0 else ('head', 'base')
+              for variant in order:
+                  for old in glob.glob(os.path.join(zed, 'trace-*.json')):
+                      os.remove(old)
+                  start = time.perf_counter_ns()
+                  proc = subprocess.run(
+                      [bins[variant], 'check', '-q', '-p', 'zed', '--locked'],
+                      cwd=zed, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      text=True,
+                  )
+                  wall_ms = (time.perf_counter_ns() - start) / 1_000_000
+                  if proc.returncode != 0:
+                      raise SystemExit(f'profile {variant} failed: {proc.stderr[-4000:]}')
+                  traces = glob.glob(os.path.join(zed, 'trace-*.json'))
+                  if len(traces) != 1:
+                      raise SystemExit(f'expected one trace for {variant}, got {traces}')
+                  trace = traces[0]
+                  with open(trace) as f:
+                      data = json.load(f)
+                  events = data.get('traceEvents', data if isinstance(data, list) else [])
+                  candidates = []
+                  all_execute = []
+                  for event in events:
+                      if not isinstance(event, dict):
+                          continue
+                      name = str(event.get('name', ''))
+                      if 'execute' in name.lower():
+                          all_execute.append({
+                              'name': name,
+                              'cat': event.get('cat'),
+                              'ph': event.get('ph'),
+                              'dur': event.get('dur'),
+                              'args': event.get('args'),
+                          })
+                      if name == 'execute' and event.get('ph') == 'X' and isinstance(event.get('dur'), (int, float)):
+                          candidates.append(float(event['dur']) / 1000.0)
+                  if not candidates:
+                      diagnostic = os.path.join(results, f'execute-events-{variant}-{block}.json')
+                      with open(diagnostic, 'w') as f:
+                          json.dump(all_execute[:200], f, indent=2)
+                      raise SystemExit(f'could not identify complete JobQueue execute span; wrote {diagnostic}')
+                  execute_ms = max(candidates)
+                  dest = os.path.join(results, f'trace-{variant}-{block}.json')
+                  os.replace(trace, dest)
+                  rows.append({
+                      'block': block,
+                      'variant': variant,
+                      'wall_ms': wall_ms,
+                      'job_queue_execute_ms': execute_ms,
+                      'execute_candidate_count': len(candidates),
+                  })
+                  print(f'profile block={block} variant={variant} wall_ms={wall_ms:.3f} execute_ms={execute_ms:.3f}')
+
+          with open(os.path.join(results, 'profile-runs.csv'), 'w', newline='') as f:
+              w = csv.DictWriter(f, fieldnames=rows[0].keys())
+              w.writeheader(); w.writerows(rows)
+
+          import statistics
+          summary = {}
+          for variant in bins:
+              xs = [r['job_queue_execute_ms'] for r in rows if r['variant'] == variant]
+              ws = [r['wall_ms'] for r in rows if r['variant'] == variant]
+              summary[variant] = {
+                  'n': len(xs),
+                  'job_queue_execute_mean_ms': statistics.mean(xs),
+                  'job_queue_execute_median_ms': statistics.median(xs),
+                  'job_queue_execute_stdev_ms': statistics.stdev(xs),
+                  'profiled_wall_median_ms': statistics.median(ws),
+              }
+          b = summary['base']['job_queue_execute_median_ms']
+          h = summary['head']['job_queue_execute_median_ms']
+          summary['comparison'] = {
+              'job_queue_execute_median_difference_ms_base_minus_head': b - h,
+              'job_queue_execute_median_improvement_percent': (b - h) / b * 100,
+              'job_queue_execute_median_speedup_ratio': b / h,
+          }
+          with open(os.path.join(results, 'profile-summary.json'), 'w') as f:
+              json.dump(summary, f, indent=2, sort_keys=True)
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+          for trace in "$RUNNER_TEMP"/results/trace-*.json; do gzip -9 "$trace"; done
+
+      - name: Produce benchmark report
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, os
+          root = os.environ['RUNNER_TEMP']
+          r = os.path.join(root, 'results')
+          with open(os.path.join(r, 'unit-graph-summary.json')) as f: graph = json.load(f)
+          with open(os.path.join(r, 'wall-summary.json')) as f: wall = json.load(f)
+          with open(os.path.join(r, 'profile-summary.json')) as f: prof = json.load(f)
+          lines = [
+              '# Cargo scheduler benchmark on Zed',
+              '',
+              f"- Zed commit: `{graph['zed_sha']}`",
+              f"- Cargo base: `{graph['cargo_base_sha']}`",
+              f"- Cargo PR: `{graph['cargo_head_sha']}`",
+              f"- Command: `cargo check -p zed --locked` on one fully warmed target, alternating binaries",
+              f"- Unit graph: {graph['units']} units, {graph['initially_ready_units']} initially ready, {graph['dependency_edges']} dependency edges",
+              '',
+              '## Warm no-op wall time',
+              '',
+              '| Variant | n | Median | Mean | Stddev | p95 |',
+              '|---|---:|---:|---:|---:|---:|',
+              f"| Base | {wall['base']['n']} | {wall['base']['median_ms']:.3f} ms | {wall['base']['mean_ms']:.3f} ms | {wall['base']['stdev_ms']:.3f} ms | {wall['base']['p95_ms']:.3f} ms |",
+              f"| PR | {wall['head']['n']} | {wall['head']['median_ms']:.3f} ms | {wall['head']['mean_ms']:.3f} ms | {wall['head']['stdev_ms']:.3f} ms | {wall['head']['p95_ms']:.3f} ms |",
+              '',
+              f"Median difference (base - PR): {wall['comparison']['median_difference_ms_base_minus_head']:.3f} ms ({wall['comparison']['median_improvement_percent']:.2f}%); ratio {wall['comparison']['median_speedup_ratio']:.4f}x.",
+              f"Paired mean difference: {wall['comparison']['paired_mean_difference_ms_base_minus_head']:.3f} ms; bootstrap 95% CI [{wall['comparison']['paired_mean_difference_95ci_ms'][0]:.3f}, {wall['comparison']['paired_mean_difference_95ci_ms'][1]:.3f}] ms.",
+              '',
+              '## Cargo internal profiler: `JobQueue::execute`',
+              '',
+              '| Variant | n | Median | Mean | Stddev |',
+              '|---|---:|---:|---:|---:|',
+              f"| Base | {prof['base']['n']} | {prof['base']['job_queue_execute_median_ms']:.3f} ms | {prof['base']['job_queue_execute_mean_ms']:.3f} ms | {prof['base']['job_queue_execute_stdev_ms']:.3f} ms |",
+              f"| PR | {prof['head']['n']} | {prof['head']['job_queue_execute_median_ms']:.3f} ms | {prof['head']['job_queue_execute_mean_ms']:.3f} ms | {prof['head']['job_queue_execute_stdev_ms']:.3f} ms |",
+              '',
+              f"Median difference (base - PR): {prof['comparison']['job_queue_execute_median_difference_ms_base_minus_head']:.3f} ms ({prof['comparison']['job_queue_execute_median_improvement_percent']:.2f}%); ratio {prof['comparison']['job_queue_execute_median_speedup_ratio']:.4f}x.",
+              '',
+              'The comparison uses the same runner, Zed checkout, Rust 1.95.0 toolchain, dependency cache, and warmed target directory. Runs alternate base and PR order to reduce temporal bias. The first compilation and four additional warmups are excluded.',
+          ]
+          report = '\n'.join(lines) + '\n'
+          with open(os.path.join(r, 'summary.md'), 'w') as f: f.write(report)
+          print('===BENCHMARK_SUMMARY_BEGIN===')
+          print(report, end='')
+          print('===BENCHMARK_SUMMARY_END===')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f: f.write(report)
+          PY
+
+      - name: Upload raw benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-cargo-scheduler-benchmark
+          path: ${{ runner.temp }}/results
+          if-no-files-found: error
+          retention-days: 30
