@@ -1,0 +1,200 @@
+name: Cargo scheduler source artifact
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  QUEUE_SHA: 9c8691d224960d8688e19ef310686c71490cdb05
+  __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS: nightly
+
+jobs:
+  validate-cargo-scheduler:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact Cargo PR commit
+        uses: actions/checkout@v4
+        with:
+          repository: zozo123/cargo
+          ref: ${{ env.QUEUE_SHA }}
+          fetch-depth: 0
+          path: cargo-pr
+
+      - name: Install pinned toolchain
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup component add --toolchain 1.97.0 rustfmt clippy
+
+      - name: Apply complete scheduler patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("cargo-pr/src/compiler/job_queue/mod.rs")
+          source = path.read_text()
+          source = source.replace(
+              "use std::cell::RefCell;\n",
+              "use std::cell::RefCell;\nuse std::cmp::Ordering;\nuse std::collections::BinaryHeap;\n",
+              1,
+          )
+
+          marker = "pub struct JobQueue<'gctx> {\n    queue: DependencyQueue<Unit, Artifact, Job>,\n    counts: HashMap<PackageId, usize>,\n    timings: Timings<'gctx>,\n}\n\n"
+          addition = r'''/// A job that is ready to run, ordered by Cargo's scheduling priority.
+///
+/// `order` preserves the previous sorted-`Vec` behavior for equal priorities:
+/// the job dequeued later is scheduled first.
+struct Pending<T> {
+    value: T,
+    priority: usize,
+    order: usize,
+}
+
+impl<T> PartialEq for Pending<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.order == other.order
+    }
+}
+
+impl<T> Eq for Pending<T> {}
+
+impl<T> PartialOrd for Pending<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for Pending<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.order.cmp(&other.order))
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+    use std::collections::BinaryHeap;
+
+    #[test]
+    fn pops_highest_priority_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending {
+            value: "low",
+            priority: 1,
+            order: 0,
+        });
+        queue.push(Pending {
+            value: "high",
+            priority: 3,
+            order: 1,
+        });
+        queue.push(Pending {
+            value: "middle",
+            priority: 2,
+            order: 2,
+        });
+        assert_eq!(queue.pop().unwrap().value, "high");
+        assert_eq!(queue.pop().unwrap().value, "middle");
+        assert_eq!(queue.pop().unwrap().value, "low");
+    }
+
+    #[test]
+    fn pops_later_equal_priority_job_first() {
+        let mut queue = BinaryHeap::new();
+        queue.push(Pending {
+            value: "first",
+            priority: 1,
+            order: 0,
+        });
+        queue.push(Pending {
+            value: "second",
+            priority: 1,
+            order: 1,
+        });
+        assert_eq!(queue.pop().unwrap().value, "second");
+        assert_eq!(queue.pop().unwrap().value, "first");
+    }
+}
+
+'''
+          assert source.count(marker) == 1
+          source = source.replace(marker, marker + addition, 1)
+
+          old_fields = "    pending_queue: Vec<(Unit, Job, usize)>,\n    print: DiagnosticPrinter<'gctx>,\n"
+          new_fields = "    pending_queue: BinaryHeap<Pending<(Unit, Job)>>,\n    next_pending_order: usize,\n    print: DiagnosticPrinter<'gctx>,\n"
+          assert source.count(old_fields) == 1
+          source = source.replace(old_fields, new_fields, 1)
+
+          old_init = "            pending_queue: Vec::new(),\n            print: DiagnosticPrinter::new(\n"
+          new_init = "            pending_queue: BinaryHeap::new(),\n            next_pending_order: 0,\n            print: DiagnosticPrinter::new(\n"
+          assert source.count(old_init) == 1
+          source = source.replace(old_init, new_init, 1)
+
+          old_insert = r'''            // We want to keep the pieces of work in the `pending_queue` sorted
+            // by their priorities, and insert the current job at its correctly
+            // sorted position: following the lower priority jobs, and the ones
+            // with the same priority (since they were dequeued before the
+            // current one, we also keep that relation).
+            let idx = self
+                .pending_queue
+                .partition_point(|&(_, _, p)| p <= priority);
+            self.pending_queue.insert(idx, (unit, job, priority));
+'''
+          new_insert = r'''            let order = self.next_pending_order;
+            self.next_pending_order = self.next_pending_order.checked_add(1).unwrap();
+            self.pending_queue.push(Pending {
+                value: (unit, job),
+                priority,
+                order,
+            });
+'''
+          assert source.count(old_insert) == 1
+          source = source.replace(old_insert, new_insert, 1)
+
+          old_comment = r'''        // The `pending_queue` is sorted in ascending priority order, and we
+        // remove items from its end to schedule the highest priority items
+        // sooner.
+'''
+          assert source.count(old_comment) == 1
+          source = source.replace(
+              old_comment,
+              "        // The max-heap schedules the highest-priority job first.\n",
+              1,
+          )
+
+          old_pop = "            let (unit, job, _) = self.pending_queue.pop().unwrap();\n"
+          new_pop = r'''            let Pending {
+                value: (unit, job),
+                ..
+            } = self.pending_queue.pop().unwrap();
+'''
+          assert source.count(old_pop) == 1
+          source = source.replace(old_pop, new_pop, 1)
+          path.write_text(source)
+          PY
+
+          cargo +1.97.0 fmt --manifest-path cargo-pr/Cargo.toml --all
+          git -C cargo-pr diff --check
+          git -C cargo-pr diff > "$RUNNER_TEMP/final-scheduler.patch"
+
+      - name: Validate exact source
+        run: |
+          cargo +1.97.0 test --manifest-path cargo-pr/Cargo.toml --lib util::dependency_queue
+          cargo +1.97.0 test --manifest-path cargo-pr/Cargo.toml --lib compiler::job_queue::pending_tests
+          cargo +1.97.0 clippy --manifest-path cargo-pr/Cargo.toml --lib --tests --benches -- -D warnings
+          CARGO_TARGET_DIR="$RUNNER_TEMP/cargo-target" \
+            cargo +1.97.0 build --release --locked \
+            --manifest-path cargo-pr/Cargo.toml --bin cargo
+
+      - name: Upload exact validated source
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-scheduler-final-source
+          path: |
+            cargo-pr/src/compiler/job_queue/mod.rs
+            ${{ runner.temp }}/final-scheduler.patch
+          if-no-files-found: error
