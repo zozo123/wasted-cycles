@@ -39,6 +39,13 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Node 24 LTS ships npm 11; npm 10's peer resolver crashes installing html-validate.
+      - name: Use Node.js 24 LTS
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
       - name: Validate GitHub Pages HTML
         run: npx --yes html-validate@11.6.0 docs/index.html
 
